@@ -54,15 +54,18 @@ class BaseModel(nn.Module):
         """Encode source. Returns (src_enc, src_mask). For encoder_only, src_enc is logits."""
         raise NotImplementedError
 
-    def _decode_train(self, task, dec_input, dec_input_len, src_enc, src_mask):
-        """Decoder forward during training. Returns logits (bs, slen, n_words)."""
+    def _decode_train(self, task, dec_input, dec_input_len, src_enc, src_mask, target_idx=0):
+        """Decoder forward during training. Returns logits (bs, slen, n_words).
+
+        target_idx selects which decoder to use (multi-target); default 0.
+        """
         raise NotImplementedError
 
-    def _prefill(self, task, gen_prefix, gen_prefix_len, max_new_tokens, src_enc, src_mask):
+    def _prefill(self, task, gen_prefix, gen_prefix_len, max_new_tokens, src_enc, src_mask, target_idx=0):
         """Prefill generation state with prefix. Returns (logits, gen_state)."""
         raise NotImplementedError
 
-    def _generate_step(self, task, token, token_len, src_enc, src_mask, gen_state):
+    def _generate_step(self, task, token, token_len, src_enc, src_mask, gen_state, target_idx=0):
         """Single autoregressive decode step. Returns (logits, gen_state)."""
         raise NotImplementedError
 
@@ -74,7 +77,7 @@ class BaseModel(nn.Module):
         """Reorder generation state for beam search. Returns new gen_state."""
         raise NotImplementedError
 
-    def forward(self, enc_problem, enc_problem_len, dec_tgt, dec_tgt_len, prefix_len, task):
+    def forward(self, enc_problem, enc_problem_len, dec_tgt, dec_tgt_len, prefix_len, task, target_idx=0):
         if self.architecture == "encoder_only":
             logits, _ = self._encode(enc_problem, enc_problem_len)
             targets = dec_tgt
@@ -84,11 +87,11 @@ class BaseModel(nn.Module):
         elif self.architecture == "encoder_decoder":
             src_enc, src_mask = self._encode(enc_problem, enc_problem_len)
             dec_input = dec_tgt[:, :-1]
-            logits = self._decode_train(task, dec_input, dec_tgt_len - 1, src_enc, src_mask)
+            logits = self._decode_train(task, dec_input, dec_tgt_len - 1, src_enc, src_mask, target_idx=target_idx)
             targets = dec_tgt[:, 1:]
         else:
             dec_input = dec_tgt[:, :-1]
-            logits = self._decode_train(task, dec_input, dec_tgt_len - 1, None, None)
+            logits = self._decode_train(task, dec_input, dec_tgt_len - 1, None, None, target_idx=target_idx)
             targets = dec_tgt[:, 1:]
 
         # Mask prefix tokens from loss
@@ -116,7 +119,7 @@ class BaseModel(nn.Module):
         return generated_tokens, generated_lengths
 
     @torch.no_grad()
-    def generate(self, enc_src, enc_src_len, gen_prefix, gen_prefix_len, max_new_tokens, temperature, top_k, top_p, task):
+    def generate(self, enc_src, enc_src_len, gen_prefix, gen_prefix_len, max_new_tokens, temperature, top_k, top_p, task, target_idx=0):
         assert self.architecture != "encoder_only"
         batch_size = gen_prefix.size(0)
 
@@ -124,7 +127,7 @@ class BaseModel(nn.Module):
             src_enc, src_mask = self._encode(enc_src, enc_src_len)
         else:
             src_enc, src_mask = None, None
-        logits, gen_state = self._prefill(task, gen_prefix, gen_prefix_len, max_new_tokens, src_enc, src_mask)
+        logits, gen_state = self._prefill(task, gen_prefix, gen_prefix_len, max_new_tokens, src_enc, src_mask, target_idx=target_idx)
 
         generated_tokens = torch.full((batch_size, max_new_tokens), self.pad_index, dtype=torch.long, device=self.device)
         generated_lengths = torch.zeros(batch_size, dtype=torch.long, device=self.device)
@@ -137,7 +140,7 @@ class BaseModel(nn.Module):
             if step == 0:
                 current_token = self._sample(logits[:, -1, :], temperature, top_k, top_p, 1)
             else:
-                logits, gen_state = self._generate_step(task, current_token, ones, src_enc, src_mask, gen_state)
+                logits, gen_state = self._generate_step(task, current_token, ones, src_enc, src_mask, gen_state, target_idx=target_idx)
                 current_token = self._sample(logits[:, -1, :], temperature, top_k, top_p, 1)
             current_token[finished] = self.pad_index
             active = ~finished
@@ -151,7 +154,7 @@ class BaseModel(nn.Module):
 
     @torch.no_grad()
     def beam_generate(
-        self, enc_src, enc_src_len, gen_prefix, gen_prefix_len, max_new_tokens, beam_size, length_penalty, temperature, top_k, top_p, task
+        self, enc_src, enc_src_len, gen_prefix, gen_prefix_len, max_new_tokens, beam_size, length_penalty, temperature, top_k, top_p, task, target_idx=0
     ):
         assert self.architecture != "encoder_only"
         n_words = self.n_words
@@ -167,7 +170,7 @@ class BaseModel(nn.Module):
 
         gen_prefix_beams = gen_prefix.unsqueeze(1).expand(-1, beam_size, -1).reshape(total_beams, -1)
         gen_prefix_len_beams = gen_prefix_len.unsqueeze(1).expand(-1, beam_size).reshape(total_beams)
-        logits, gen_state = self._prefill(task, gen_prefix_beams, gen_prefix_len_beams, max_new_tokens, src_enc, src_mask)
+        logits, gen_state = self._prefill(task, gen_prefix_beams, gen_prefix_len_beams, max_new_tokens, src_enc, src_mask, target_idx=target_idx)
 
         done = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
         finished_scores = torch.full((batch_size, beam_size), -1e9, device=self.device)
@@ -191,7 +194,7 @@ class BaseModel(nn.Module):
             if step == 0:
                 step_logits = logits[:, -1, :]
             else:
-                logits, gen_state = self._generate_step(task, current_tokens, ones, src_enc, src_mask, gen_state)
+                logits, gen_state = self._generate_step(task, current_tokens, ones, src_enc, src_mask, gen_state, target_idx=target_idx)
                 step_logits = logits[:, -1, :]
             if use_sampling:
                 step_logits = self._filter_logits(step_logits, temperature, top_k, top_p)

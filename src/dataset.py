@@ -14,6 +14,9 @@ class EnvDataset(Dataset):
         super().__init__()
         self.env = env
         self.train = train
+        # Number of prediction targets (K). K == 1 is the stock single-target path;
+        # K > 1 means one decoder target per invariant (multi-target tasks).
+        self.n_targets = getattr(env, "n_targets", 1)
         self.env_base_seed = params.env_base_seed
         self.path = path
         self.global_rank = params.global_rank
@@ -68,6 +71,37 @@ class EnvDataset(Dataset):
             assert size > 0
             self.size = size
 
+    def _split_parts(self, parts):
+        """Split a tab-separated line's parts into (problem, question, answers).
+
+        Supports K = self.n_targets targets. Valid layouts are:
+          - 1 + K columns: problem + K answers (no question)
+          - 2 + K columns: problem + question + K answers
+        `answers` is always a list of length K (length 1 for the stock path).
+        Returns None on an invalid column count.
+        """
+        k = self.n_targets
+        n = len(parts)
+        if n == 1 + k:
+            return parts[0], None, list(parts[1:])
+        if n == 2 + k:
+            return parts[0], parts[1], list(parts[2:])
+        return None
+
+    def _valid_ncols(self, n):
+        return n in (1 + self.n_targets, 2 + self.n_targets)
+
+    def _decode_answers(self, answer):
+        """Decode a list of K answer token-lists into answer_data.
+
+        Single-target (K == 1) returns the single decoded object (backward
+        compatible); multi-target returns a length-K list of decoded objects,
+        each parsed with its own tokenizer.
+        """
+        if self.n_targets == 1:
+            return self.env.answer_tokenizers[0].decode(answer[0])
+        return [tok.decode(a) for tok, a in zip(self.env.answer_tokenizers, answer)]
+
     def _build_index(self):
         offsets = []
         with open(self.path, "rb") as f:
@@ -83,7 +117,7 @@ class EnvDataset(Dataset):
                 if self.train and (n_read - 1) % self.n_gpu_per_node != self.local_rank:
                     continue
                 parts = line.rstrip(b"\n").split(b"\t")
-                if len(parts) not in (2, 3):
+                if not self._valid_ncols(len(parts)):
                     continue
                 offsets.append(off)
         return np.array(offsets, dtype=np.int64)
@@ -114,14 +148,17 @@ class EnvDataset(Dataset):
             endfile = max_lines is None or n_read < max_lines
             self.seekpos = 0 if endfile else f.tell()
 
-        # Format: problem \t question \t answer (question can be empty)
+        # Format: problem [\t question] \t answer_0 [\t answer_1 ...] (K answers).
+        # Each stored entry is [problem_str, question_str_or_None, [answer_str, ...]]
+        # with the answer list of length K (length 1 for the single-target path).
         data = []
         for line in lines:
             parts = line.split("\t")
-            if len(parts) == 3:
-                data.append(parts)
-            elif len(parts) == 2:
-                data.append([parts[0], None, parts[1]])
+            split = self._split_parts(parts)
+            if split is None:
+                continue
+            problem_str, question_str, answer_strs = split
+            data.append([problem_str, question_str, answer_strs])
         logger.info(f"Loaded {len(data)} equations from the disk.")
         return data
 
@@ -146,7 +183,11 @@ class EnvDataset(Dataset):
         if self.train:
             problem, question, answer = zip(*elements)
             if self.export_data:
-                return list(problem), list(question), list(answer)
+                # Export is single-target (K == 1); unwrap the per-target list so the
+                # exported answer is a flat token list (" ".join in trainer.export_data).
+                # Fail loudly rather than silently dropping targets 1..K-1.
+                assert self.env.n_targets == 1, "export_data is only supported for single-target tasks"
+                return list(problem), list(question), [a[0] for a in answer]
         else:
             problem, question, answer, problem_data, question_data, answer_data, class_id = zip(*elements)
 
@@ -162,17 +203,27 @@ class EnvDataset(Dataset):
         else:
             enc_problem, enc_problem_len = self.batch_sequences([[self.env.word2id[w] for w in seq] for seq in enc_seqs], bos=False)
 
-        dec_seqs, prefix_lens = [], []
-        for enc_seq, ai in zip(enc_seqs, answer):
-            prefix = enc_seq + ["<ans>"] if self.decoder_only else ["<ans>"]
-            dec_seqs.append(prefix + list(ai))
-            prefix_lens.append(1 + len(prefix))
-
-        dec_tgt, dec_tgt_len = self.batch_sequences([[self.env.word2id[w] for w in seq] for seq in dec_seqs], bos=not self.encoder_only)
+        # answer[i] is a list of K token-lists (one per target). Build one decoder
+        # target per target index t. The prefix (and thus prefix_len) is the same
+        # across targets, so compute it once. K > 1 is encoder_decoder-only (guarded
+        # in build_env), where the prefix is just ["<ans>"].
+        k = self.n_targets
+        dec_targets = []
+        prefix_lens = None
+        for t in range(k):
+            dec_seqs, pls = [], []
+            for enc_seq, ai in zip(enc_seqs, answer):
+                prefix = enc_seq + ["<ans>"] if self.decoder_only else ["<ans>"]
+                dec_seqs.append(prefix + list(ai[t]))
+                pls.append(1 + len(prefix))
+            dec_tgt_t, dec_tgt_len_t = self.batch_sequences([[self.env.word2id[w] for w in seq] for seq in dec_seqs], bos=not self.encoder_only)
+            dec_targets.append((dec_tgt_t, dec_tgt_len_t))
+            if prefix_lens is None:
+                prefix_lens = pls
         prefix_len = torch.tensor(prefix_lens, dtype=torch.long)
 
         if self.train:
-            return (enc_problem, enc_problem_len), (dec_tgt, dec_tgt_len), prefix_len
+            return (enc_problem, enc_problem_len), dec_targets, prefix_len
 
         class_id = list(class_id)
 
@@ -182,13 +233,13 @@ class EnvDataset(Dataset):
             gen_seqs.append([self.env.word2id[w] for w in prefix])
 
         gen_prefix, gen_prefix_len = self.batch_sequences(gen_seqs, bos=True, eos=False, left_pad=True)
-        ref_answer, ref_answer_len = self.batch_sequences([[self.env.word2id[w] for w in ai] for ai in answer], bos=False)
+        ref_answers = [self.batch_sequences([[self.env.word2id[w] for w in ai[t]] for ai in answer], bos=False) for t in range(k)]
         return (
             (enc_problem, enc_problem_len),
-            (dec_tgt, dec_tgt_len),
+            dec_targets,
             prefix_len,
             (gen_prefix, gen_prefix_len),
-            (ref_answer, ref_answer_len),
+            ref_answers,
             class_id,
             list(problem_data),
             list(question_data),
@@ -250,11 +301,12 @@ class EnvDataset(Dataset):
                 else:
                     idx = self.rng.integers(len(self.data))
 
-        problem_str, question_str, answer_str = self.data[idx]
+        problem_str, question_str, answer_strs = self.data[idx]
         problem = problem_str.split()
         question = question_str.split() if question_str else None
-        answer = answer_str.split()
-        assert len(problem) >= 1 and len(answer) >= 1
+        # answer is a list of K token-lists (length 1 for the single-target path).
+        answer = [a.split() for a in answer_strs]
+        assert len(problem) >= 1 and all(len(a) >= 1 for a in answer)
         if self.train:
             return problem, question, answer
         problem_data = self.env.problem_tokenizer.decode(problem)
@@ -262,7 +314,7 @@ class EnvDataset(Dataset):
             question_data = self.env.query_tokenizer.decode(question) if question else None
         else:
             question_data = None
-        answer_data = self.env.answer_tokenizer.decode(answer)
+        answer_data = self._decode_answers(answer)
         class_id = self.env.generator.encode_class_id(problem_data, question_data, answer_data)
         return problem, question, answer, problem_data, question_data, answer_data, class_id
 
@@ -274,17 +326,14 @@ class EnvDataset(Dataset):
         self._fh.seek(off)
         line = self._fh.readline().decode("utf-8").rstrip("\n")
         parts = line.split("\t")
-        if len(parts) == 3:
-            problem_str, question_str, answer_str = parts
-        elif len(parts) == 2:
-            problem_str, answer_str = parts
-            question_str = None
-        else:
+        split = self._split_parts(parts)
+        if split is None:
             return self._read_sample_indexed(index)
+        problem_str, question_str, answer_strs = split
         problem = problem_str.split()
         question = question_str.split() if question_str else None
-        answer = answer_str.split()
-        if not problem or not answer:
+        answer = [a.split() for a in answer_strs]
+        if not problem or any(len(a) == 0 for a in answer):
             return self._read_sample_indexed(index)
         if self.train:
             return problem, question, answer
@@ -293,7 +342,7 @@ class EnvDataset(Dataset):
             question_data = self.env.query_tokenizer.decode(question) if question else None
         else:
             question_data = None
-        answer_data = self.env.answer_tokenizer.decode(answer)
+        answer_data = self._decode_answers(answer)
         class_id = self.env.generator.encode_class_id(problem_data, question_data, answer_data)
         return problem, question, answer, problem_data, question_data, answer_data, class_id
 
@@ -310,6 +359,11 @@ class EnvDataset(Dataset):
                     f"An unknown exception of type {type(e).__name__} occurred for worker {self.get_worker_id()} in line {sys.exc_info()[-1].tb_lineno}. Arguments:{e.args!r}."
                 )
                 continue
+        # Normalize the answer to a list of K token-lists so the train collate path
+        # is uniform with read_sample. gen_expr already returns a length-K list when
+        # n_targets > 1; for the single-target path it returns a flat token list.
+        if self.n_targets == 1:
+            answer = [answer]
         if self.train:
             return problem, question, answer
         else:

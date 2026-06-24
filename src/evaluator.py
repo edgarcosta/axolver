@@ -17,7 +17,9 @@ logger = getLogger()
 
 def check_hypothesis(eq, env):
     eq["hyp_tokens"] = [env.id2word[wid] for wid in eq["hyp"]]
-    eq["metrics"] = env.check_prediction(eq["problem_data"], eq["question_data"], eq["answer_data"], eq["hyp_tokens"], metrics=eq["metrics_to_eval"])
+    eq["metrics"] = env.check_prediction(
+        eq["problem_data"], eq["question_data"], eq["answer_data"], eq["hyp_tokens"], metrics=eq["metrics_to_eval"], target_idx=eq.get("target_idx", 0)
+    )
     return eq
 
 
@@ -29,6 +31,7 @@ def _process_batch(single_batch, env, params, is_beam, task, display_logs, metri
     n_perfect_match = valid.sum().item()
     batch_n_well_formed = 0
     batch_metrics = []
+    target_idx = single_batch.get("target_idx", 0)
 
     beam_log = {}
     for i in range(bs):
@@ -53,6 +56,7 @@ def _process_batch(single_batch, env, params, is_beam, task, display_logs, metri
                         "answer_data": single_batch["answer_data_list"][i],
                         "hyp": gen_tokens[i, j, :hyp_len].tolist(),
                         "task": task,
+                        "target_idx": target_idx,
                         "metrics_to_eval": metrics,
                     }
                 )
@@ -66,6 +70,7 @@ def _process_batch(single_batch, env, params, is_beam, task, display_logs, metri
                     "answer_data": single_batch["answer_data_list"][i],
                     "hyp": gen_i,
                     "task": task,
+                    "target_idx": target_idx,
                     "metrics_to_eval": metrics,
                     # Greedy decoding has no beam score
                     "score": float("-inf"),
@@ -109,7 +114,7 @@ def _process_batch(single_batch, env, params, is_beam, task, display_logs, metri
 
     if params.eval_verbose:
         assert len(beam_log) == bs
-        display_logs(beam_log, offset=single_batch["total_so_far"] - bs)
+        display_logs(beam_log, offset=single_batch["total_so_far"] - bs, target_idx=target_idx)
 
     return n_perfect_match, batch_n_well_formed, valid, batch_metrics
 
@@ -223,12 +228,19 @@ class Evaluator:
             f_export = open(eval_path, "w")
             logger.info(f"Writing evaluation results in {eval_path} ...")
 
-        def display_logs(logs, offset):
+        def display_logs(logs, offset, target_idx=0):
             if params.eval_verbose == 0:
                 return
+            # Disambiguate the shared eval file when there is more than one target;
+            # the single-target path keeps the original (label-free) format exactly.
+            if n_targets > 1:
+                name = target_names[target_idx] if target_names and target_names[target_idx] is not None else str(target_idx)
+                target_tag = f" [target {name}]"
+            else:
+                target_tag = ""
             for i, res in sorted(logs.items()):
                 n_valid = sum([int(v) for _, _, v in res["hyps"]])
-                s = f"Equation {offset + i} ({n_valid}/{len(res['hyps'])})\n"
+                s = f"Equation {offset + i}{target_tag} ({n_valid}/{len(res['hyps'])})\n"
                 s += f"problem={res['problem']}\n"
                 if res["question"] is not None:
                     s += f"question={res['question']}\n"
@@ -241,17 +253,24 @@ class Evaluator:
                 f_export.write(s + "\n")
                 f_export.flush()
 
-        # stats
-        stats = {
-            "xe_loss": 0,
-            "n_tokens": 0,
-            "n_perfect_match": 0,
-            "n_well_formed": 0,
-            "n_valid": OrderedDict(),
-            "n_total": OrderedDict(),
-            "metrics_sum": {},
-            "metrics_count": {},
-        }
+        n_targets = getattr(env, "n_targets", 1)
+        target_names = getattr(env, "target_names", None)
+
+        def _new_stats():
+            return {
+                "xe_loss": 0,
+                "n_tokens": 0,
+                "n_perfect_match": 0,
+                "n_well_formed": 0,
+                "n_valid": OrderedDict(),
+                "n_total": OrderedDict(),
+                "metrics_sum": {},
+                "metrics_count": {},
+            }
+
+        # One stats dict per target. Each target counts n_total independently over
+        # the same examples, so every target's n_total holds the identical value.
+        stats_per_target = [_new_stats() for _ in range(n_targets)]
         iterator = create_test_iterator(
             env, task, data_type, data_path=params.eval_data.split(",") if params.eval_data != "" else None, params=params
         )
@@ -262,13 +281,15 @@ class Evaluator:
             hyp_executor = ProcessPoolExecutor(max_workers=min(params.num_workers, 8))
 
         def process_and_accumulate(single_batch):
+            t = single_batch["target_idx"]
+            stats = stats_per_target[t]
             for cid in single_batch["class_id"]:
                 stats["n_total"][cid] = stats["n_total"].get(cid, 0) + 1
             single_batch["total_so_far"] = sum(stats["n_total"].values())
             bs = single_batch["bs"]
 
             greedy_valid = single_batch["greedy_valid"].sum().item()
-            logger.info(f"({single_batch['total_so_far']}/{eval_size}) Found {greedy_valid}/{bs} valid top-1 predictions.")
+            logger.info(f"[target {t}] ({single_batch['total_so_far']}/{eval_size}) Found {greedy_valid}/{bs} valid top-1 predictions.")
 
             n_perfect_match, batch_n_well_formed, valid, batch_metrics = _process_batch(
                 single_batch,
@@ -294,17 +315,17 @@ class Evaluator:
                     stats["metrics_sum"][k] = stats["metrics_sum"].get(k, 0.0) + v
                     stats["metrics_count"][k] = stats["metrics_count"].get(k, 0) + 1
 
-            logger.info(f"Found {valid.sum().item()}/{bs} solutions in hypotheses.")
+            logger.info(f"[target {t}] Found {valid.sum().item()}/{bs} solutions in hypotheses.")
 
         with cpu_sink(process_and_accumulate, decouple=decouple) as sink:
             device = params.device
             for batch in iterator:
                 (
                     (enc_problem, enc_problem_len),
-                    (dec_tgt, dec_tgt_len),
+                    dec_targets,
                     prefix_len,
                     (gen_prefix, gen_prefix_len),
-                    (ref_answer, ref_answer_len),
+                    ref_answers,
                     class_id,
                     problem_data_list,
                     question_data_list,
@@ -315,44 +336,56 @@ class Evaluator:
                     enc_problem = enc_problem.to(device)
                 if enc_problem_len is not None:
                     enc_problem_len = enc_problem_len.to(device)
-                dec_tgt, dec_tgt_len = dec_tgt.to(device), dec_tgt_len.to(device)
                 prefix_len = prefix_len.to(device)
-                ref_answer, ref_answer_len = ref_answer.to(device), ref_answer_len.to(device)
                 gen_prefix, gen_prefix_len = gen_prefix.to(device), gen_prefix_len.to(device)
-                bs = dec_tgt.size(0)
+                bs = dec_targets[0][0].size(0)
 
-                gpu_out = self._gpu_forward_and_generate(
-                    model,
-                    enc_problem,
-                    enc_problem_len,
-                    dec_tgt,
-                    dec_tgt_len,
-                    prefix_len,
-                    ref_answer,
-                    ref_answer_len,
-                    gen_prefix,
-                    gen_prefix_len,
-                    encoder_only,
-                    decoder_only,
-                    is_beam,
-                    max_beam_length,
-                    task,
-                )
+                for t in range(n_targets):
+                    dec_tgt, dec_tgt_len = dec_targets[t]
+                    ref_answer, ref_answer_len = ref_answers[t]
+                    dec_tgt, dec_tgt_len = dec_tgt.to(device), dec_tgt_len.to(device)
+                    ref_answer, ref_answer_len = ref_answer.to(device), ref_answer_len.to(device)
 
-                single_batch = {
-                    "greedy_valid": gpu_out["greedy_valid"].cpu(),
-                    "gen_tokens": gpu_out["gen_tokens"].cpu(),
-                    "gen_scores": gpu_out["gen_scores"].cpu() if gpu_out["gen_scores"] is not None else None,
-                    "gen_lengths": gpu_out["gen_lengths"].cpu(),
-                    "loss_val": gpu_out["loss"].item(),
-                    "n_batch_tokens": gpu_out["n_batch_tokens"],
-                    "bs": bs,
-                    "class_id": class_id,
-                    "problem_data_list": problem_data_list,
-                    "question_data_list": question_data_list,
-                    "answer_data_list": answer_data_list,
-                }
-                sink.submit(single_batch)
+                    # Per-target ground-truth objects: list-of-K per example when K > 1.
+                    if n_targets == 1:
+                        answer_data_list_t = answer_data_list
+                    else:
+                        answer_data_list_t = [ad[t] for ad in answer_data_list]
+
+                    gpu_out = self._gpu_forward_and_generate(
+                        model,
+                        enc_problem,
+                        enc_problem_len,
+                        dec_tgt,
+                        dec_tgt_len,
+                        prefix_len,
+                        ref_answer,
+                        ref_answer_len,
+                        gen_prefix,
+                        gen_prefix_len,
+                        encoder_only,
+                        decoder_only,
+                        is_beam,
+                        max_beam_length,
+                        task,
+                        target_idx=t,
+                    )
+
+                    single_batch = {
+                        "greedy_valid": gpu_out["greedy_valid"].cpu(),
+                        "gen_tokens": gpu_out["gen_tokens"].cpu(),
+                        "gen_scores": gpu_out["gen_scores"].cpu() if gpu_out["gen_scores"] is not None else None,
+                        "gen_lengths": gpu_out["gen_lengths"].cpu(),
+                        "loss_val": gpu_out["loss"].item(),
+                        "n_batch_tokens": gpu_out["n_batch_tokens"],
+                        "bs": bs,
+                        "target_idx": t,
+                        "class_id": class_id,
+                        "problem_data_list": problem_data_list,
+                        "question_data_list": question_data_list,
+                        "answer_data_list": answer_data_list_t,
+                    }
+                    sink.submit(single_batch)
 
         if hyp_executor is not None:
             hyp_executor.shutdown(wait=True)
@@ -361,30 +394,40 @@ class Evaluator:
             f_export.close()
             logger.info(f"Evaluation results written in {eval_path}")
 
-        # scores
-        _n_valid = sum(stats["n_valid"].values())
-        _n_total = sum(stats["n_total"].values())
-        assert _n_total == eval_size
-        logger.info(f"{_n_valid}/{_n_total} ({100. * _n_valid / _n_total}%) equations were evaluated correctly.")
+        # scores: one block per target. The single-target path (n_targets == 1)
+        # uses the original (suffix-free) metric keys for backward compatibility.
+        for t in range(n_targets):
+            stats = stats_per_target[t]
+            if n_targets == 1:
+                suffix = ""
+            else:
+                name = target_names[t] if target_names and target_names[t] is not None else str(t)
+                suffix = f"_{name}"
+            prefix = f"{data_type}_{task.upper()}{suffix}"
 
-        scores[f"{data_type}_{task.upper()}_xe_loss"] = stats["xe_loss"] / stats["n_tokens"]
-        scores[f"{data_type}_{task.upper()}_greedy_acc"] = 100.0 * stats["n_perfect_match"] / _n_total
-        scores[f"{data_type}_{task.upper()}_acc"] = 100.0 * _n_valid / _n_total
-        scores[f"{data_type}_{task.upper()}_well_formed"] = 100.0 * (stats["n_perfect_match"] + stats["n_well_formed"]) / _n_total
+            _n_valid = sum(stats["n_valid"].values())
+            _n_total = sum(stats["n_total"].values())
+            assert _n_total == eval_size
+            logger.info(f"{prefix}: {_n_valid}/{_n_total} ({100. * _n_valid / _n_total}%) equations were evaluated correctly.")
 
-        for cid, total in stats["n_total"].items():
-            valid_i = stats["n_valid"].get(cid, 0)
-            scores[f"{data_type}_{task.upper()}_acc_{cid}"] = 100.0 * valid_i / total
-            logger.info(f"{cid}: {valid_i} / {total} ({100. * valid_i / total:.2f}%)")
+            scores[f"{prefix}_xe_loss"] = stats["xe_loss"] / stats["n_tokens"]
+            scores[f"{prefix}_greedy_acc"] = 100.0 * stats["n_perfect_match"] / _n_total
+            scores[f"{prefix}_acc"] = 100.0 * _n_valid / _n_total
+            scores[f"{prefix}_well_formed"] = 100.0 * (stats["n_perfect_match"] + stats["n_well_formed"]) / _n_total
 
-        for metric_name, metric_sum in stats["metrics_sum"].items():
-            if metric_name == "is_valid":
-                continue
-            count = stats["metrics_count"][metric_name]
-            if count > 0:
-                avg = metric_sum / count
-                scores[f"{data_type}_{task.upper()}_avg_{metric_name}"] = avg
-                logger.info(f"{metric_name}: {avg:.6f} (over {count} samples)")
+            for cid, total in stats["n_total"].items():
+                valid_i = stats["n_valid"].get(cid, 0)
+                scores[f"{prefix}_acc_{cid}"] = 100.0 * valid_i / total
+                logger.info(f"{prefix} {cid}: {valid_i} / {total} ({100. * valid_i / total:.2f}%)")
+
+            for metric_name, metric_sum in stats["metrics_sum"].items():
+                if metric_name == "is_valid":
+                    continue
+                count = stats["metrics_count"][metric_name]
+                if count > 0:
+                    avg = metric_sum / count
+                    scores[f"{prefix}_avg_{metric_name}"] = avg
+                    logger.info(f"{prefix} {metric_name}: {avg:.6f} (over {count} samples)")
 
     @torch.inference_mode()
     def _gpu_forward_and_generate(
@@ -404,12 +447,13 @@ class Evaluator:
         is_beam,
         max_beam_length,
         task,
+        target_idx=0,
     ):
         params = self.params
         device = params.device
 
         with self.ctx:
-            logits, loss = model(enc_problem, enc_problem_len, dec_tgt, dec_tgt_len, prefix_len=prefix_len, task=task)
+            logits, loss = model(enc_problem, enc_problem_len, dec_tgt, dec_tgt_len, prefix_len=prefix_len, task=task, target_idx=target_idx)
         preds = logits.argmax(-1)
 
         # Greedy
@@ -449,6 +493,7 @@ class Evaluator:
                         top_k=params.top_k,
                         top_p=params.top_p,
                         task=task,
+                        target_idx=target_idx,
                     )
                 else:
                     gen_tokens, gen_lengths = model.generate(
@@ -461,6 +506,7 @@ class Evaluator:
                         top_k=params.top_k,
                         top_p=params.top_p,
                         task=task,
+                        target_idx=target_idx,
                     )
 
         return {

@@ -10,10 +10,21 @@ logger = getLogger()
 
 
 class Environment:
-    def __init__(self, params, problem_tokenizer, query_tokenizer, answer_tokenizer, generator):
+    def __init__(self, params, problem_tokenizer, query_tokenizer, answer_tokenizers, generator, target_names=None):
         self.problem_tokenizer = problem_tokenizer
         self.query_tokenizer = query_tokenizer
-        self.answer_tokenizer = answer_tokenizer
+        # answer_tokenizers is always a length-K list (K>=1). answer_tokenizer
+        # aliases the first one so single-target call sites keep working.
+        if not isinstance(answer_tokenizers, (list, tuple)):
+            answer_tokenizers = [answer_tokenizers]
+        self.answer_tokenizers = list(answer_tokenizers)
+        self.answer_tokenizer = self.answer_tokenizers[0]
+        self.n_targets = len(self.answer_tokenizers)
+        if target_names is None:
+            target_names = [None] * self.n_targets
+        assert len(target_names) == self.n_targets
+        self.target_names = list(target_names)
+        params.n_targets = self.n_targets
         self.generator = generator
         self.max_len = params.max_len
         self.max_output_len = params.max_output_len
@@ -22,7 +33,8 @@ class Environment:
         all_symbols.update(self.problem_tokenizer.symbols)
         if self.query_tokenizer is not None:
             all_symbols.update(self.query_tokenizer.symbols)
-        all_symbols.update(self.answer_tokenizer.symbols)
+        for tok in self.answer_tokenizers:
+            all_symbols.update(tok.symbols)
         self.words = SPECIAL_WORDS + sorted(all_symbols)
         self.id2word = {i: s for i, s in enumerate(self.words)}
         self.word2id = {s: i for i, s in self.id2word.items()}
@@ -49,6 +61,11 @@ class Environment:
         Returns (problem_tok, question_tok, answer_tok, problem_data, question_data, answer_data, class_id) or None.
         question_tok is [] if no question. question_data is None if no question.
         class_id is the class index from the generator's encode_class_id method (0 during training).
+
+        When n_targets == 1 the answer slot is a single token-list / single object
+        (backward compatible). When n_targets > 1 the generator returns a length-K
+        list of answers; answer_tok becomes a list of K token-lists and answer_data a
+        list of K objects (each encoded with its own tokenizer).
         """
         gen = self.generator.generate(rng, is_train=train)
         if gen is None:
@@ -56,25 +73,37 @@ class Environment:
         problem_data, question_data, answer_data = gen
         problem_tok = self.problem_tokenizer.encode(problem_data)
         question_tok = self.query_tokenizer.encode(question_data) if question_data is not None else []
-        answer_tok = self.answer_tokenizer.encode(answer_data)
         enc_len = len(problem_tok) + (1 + len(question_tok) if question_tok else 0)  # +1 for <query>
         if self.max_len > 0 and enc_len >= self.max_len:
             return None
-        if self.max_output_len > 0 and len(answer_tok) >= self.max_output_len:
-            return None
+
+        if self.n_targets == 1:
+            answer_tok = self.answer_tokenizer.encode(answer_data)
+            if self.max_output_len > 0 and len(answer_tok) >= self.max_output_len:
+                return None
+        else:
+            assert len(answer_data) == self.n_targets, f"generator returned {len(answer_data)} answers, expected {self.n_targets}"
+            answer_tok = [tok.encode(a) for tok, a in zip(self.answer_tokenizers, answer_data)]
+            if self.max_output_len > 0 and any(len(at) >= self.max_output_len for at in answer_tok):
+                return None
+
         class_id = None if train else self.generator.encode_class_id(problem_data, question_data, answer_data)
         return problem_tok, question_tok, answer_tok, problem_data, question_data, answer_data, class_id
 
-    def check_prediction(self, problem_data, question_data, answer_data, hyp_tokens, metrics):
+    def check_prediction(self, problem_data, question_data, answer_data, hyp_tokens, metrics, target_idx=0):
         """
-        Evaluate a hypothesis against the expected answer.
+        Evaluate a hypothesis against the expected answer for target `target_idx`.
         problem_data, question_data, and answer_data are raw Python objects.
         question_data can be None if no question for this task.
         hyp_tokens is a list of string tokens to be decoded.
         Returns metrics_dict where metrics_dict["is_valid"] is always present.
         """
-        hyp_data = self.answer_tokenizer.decode(hyp_tokens)
-        metrics_dict = self.generator.evaluate(problem_data, question_data, answer_data, hyp_data, metrics=metrics)
+        hyp_data = self.answer_tokenizers[target_idx].decode(hyp_tokens)
+        if self.n_targets == 1:
+            # Backward compatible: stock single-target generators take no target_idx.
+            metrics_dict = self.generator.evaluate(problem_data, question_data, answer_data, hyp_data, metrics=metrics)
+        else:
+            metrics_dict = self.generator.evaluate(problem_data, question_data, answer_data, hyp_data, metrics=metrics, target_idx=target_idx)
         assert "is_valid" in metrics_dict
         return metrics_dict
 

@@ -26,8 +26,27 @@ def build_env(params):
     query_tokenizer = None
     if "query_tokenizer" in built:
         query_tokenizer = built["query_tokenizer"]
-    answer_tokenizer = built["answer_tokenizer"]
+    # Multi-target tasks supply "answer_tokenizers" (a length-K list); single-target
+    # tasks supply "answer_tokenizer". Normalize to a list for Environment.
+    if "answer_tokenizers" in built:
+        answer_tokenizers = built["answer_tokenizers"]
+    else:
+        answer_tokenizers = [built["answer_tokenizer"]]
+    target_names = built.get("target_names")
     generator = built["generator"]
+
+    # Guard rail: the multi-decoder scaffold is only wired for the transformer
+    # encoder_decoder. Single-target (K == 1) keeps supporting every architecture.
+    if len(answer_tokenizers) > 1:
+        assert params.model_type == "transformer", f"n_targets={len(answer_tokenizers)} requires model_type='transformer', got '{params.model_type}'"
+        assert (
+            params.architecture == "encoder_decoder"
+        ), f"n_targets={len(answer_tokenizers)} requires architecture='encoder_decoder', got '{params.architecture}'"
     return Environment(
-        params, problem_tokenizer=problem_tokenizer, query_tokenizer=query_tokenizer, answer_tokenizer=answer_tokenizer, generator=generator
+        params,
+        problem_tokenizer=problem_tokenizer,
+        query_tokenizer=query_tokenizer,
+        answer_tokenizers=answer_tokenizers,
+        generator=generator,
+        target_names=target_names,
     )

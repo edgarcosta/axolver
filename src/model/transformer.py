@@ -352,10 +352,24 @@ class TransformerModel(BaseModel):
         if self.architecture in ("encoder_only", "encoder_decoder"):
             self.encoder = TransformerBackbone(params, is_encoder=True, with_output=(self.architecture == "encoder_only"))
         if self.architecture in ("decoder_only", "encoder_decoder"):
-            self.decoder = TransformerBackbone(params, is_encoder=False, with_output=True)
+            # One decoder per prediction target (shared encoder). n_targets defaults
+            # to 1. To preserve the single-target checkpoint format exactly (keys
+            # "decoder.*"), the K == 1 case registers self.decoder and exposes
+            # self.decoders as a plain (unregistered) list aliasing it. For K > 1 we
+            # register a ModuleList ("decoders.*") and alias self.decoder to the
+            # first decoder without re-registering it (so no duplicate "decoder.*").
+            n_targets = getattr(params, "n_targets", 1)
+            if n_targets == 1:
+                self.decoder = TransformerBackbone(params, is_encoder=False, with_output=True)
+                # Plain list (not nn.ModuleList) -> not tracked as submodules.
+                self.decoders = [self.decoder]
+            else:
+                self.decoders = nn.ModuleList([TransformerBackbone(params, is_encoder=False, with_output=True) for _ in range(n_targets)])
+                # object.__setattr__ avoids registering a duplicate "decoder.*" submodule.
+                object.__setattr__(self, "decoder", self.decoders[0])
 
-    def _get_decoder(self, task):
-        return self.decoder
+    def _get_decoder(self, target_idx=0):
+        return self.decoders[target_idx]
 
     def _init_kv_cache(self, decoder, batch_size, max_len):
         kv_cache = []
@@ -386,20 +400,20 @@ class TransformerModel(BaseModel):
         src_mask = self._make_src_mask(src_len, enc_output.size(1), src.device)
         return enc_output, src_mask
 
-    def _decode_train(self, task, dec_input, dec_input_len, src_enc, src_mask):
-        decoder = self._get_decoder(task)
+    def _decode_train(self, task, dec_input, dec_input_len, src_enc, src_mask, target_idx=0):
+        decoder = self._get_decoder(target_idx)
         return decoder(dec_input, dec_input_len, src_enc=src_enc, src_mask=src_mask)
 
-    def _prefill(self, task, gen_prefix, gen_prefix_len, max_new_tokens, src_enc, src_mask):
-        decoder = self._get_decoder(task)
+    def _prefill(self, task, gen_prefix, gen_prefix_len, max_new_tokens, src_enc, src_mask, target_idx=0):
+        decoder = self._get_decoder(target_idx)
         batch_size = gen_prefix.size(0)
         total_len = gen_prefix.size(1) + max_new_tokens
         kv_cache = self._init_kv_cache(decoder, batch_size, total_len)
         logits = decoder(gen_prefix, gen_prefix_len, src_enc=src_enc, src_mask=src_mask, kv_cache=kv_cache)
         return logits, (kv_cache, gen_prefix_len, 0)
 
-    def _generate_step(self, task, token, token_len, src_enc, src_mask, gen_state):
-        decoder = self._get_decoder(task)
+    def _generate_step(self, task, token, token_len, src_enc, src_mask, gen_state, target_idx=0):
+        decoder = self._get_decoder(target_idx)
         kv_cache, start_steps, step = gen_state
         step += 1
         start_pos = start_steps + step - 1

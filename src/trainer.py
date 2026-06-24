@@ -305,28 +305,46 @@ class Trainer:
         params = self.params
         device = params.device
 
-        (enc_src, enc_src_len), (dec_tgt, dec_tgt_len), prefix_len = self.get_batch()
-
-        bs = dec_tgt_len.size(0)
-        if params.architecture == "decoder_only":
-            n_tokens = (dec_tgt_len - 1).sum().item()
-        elif params.architecture == "encoder_only":
-            n_tokens = (enc_src_len - 1).sum().item()
-        else:
-            n_tokens = (enc_src_len + dec_tgt_len - 2).sum().item()
+        # dec_targets is a list of K (dec_tgt, dec_tgt_len) tuples (K == 1 for the
+        # single-target path); the total loss is the mean of the K cross-entropies.
+        (enc_src, enc_src_len), dec_targets, prefix_len = self.get_batch()
+        n_targets = len(dec_targets)
 
         non_blocking = device == "cuda"
         if enc_src is not None:
             enc_src = enc_src.to(device, non_blocking=non_blocking)
         if enc_src_len is not None:
             enc_src_len = enc_src_len.to(device, non_blocking=non_blocking)
-        dec_tgt, dec_tgt_len = dec_tgt.to(device, non_blocking=non_blocking), dec_tgt_len.to(device, non_blocking=non_blocking)
         prefix_len = prefix_len.to(device, non_blocking=non_blocking)
+        dec_targets = [(dt.to(device, non_blocking=non_blocking), dl.to(device, non_blocking=non_blocking)) for dt, dl in dec_targets]
+
+        bs = dec_targets[0][1].size(0)
+        n_tokens = 0
+        for dec_tgt, dec_tgt_len in dec_targets:
+            if params.architecture == "decoder_only":
+                n_tokens += (dec_tgt_len - 1).sum().item()
+            elif params.architecture == "encoder_only":
+                n_tokens += (enc_src_len - 1).sum().item()
+            else:
+                n_tokens += (enc_src_len + dec_tgt_len - 2).sum().item()
 
         with self.ctx:
-            _, loss = self.model(enc_src, enc_src_len, dec_tgt, dec_tgt_len, prefix_len=prefix_len, task=self.task)
+            total_loss = 0.0
+            per_target_losses = []
+            for t, (dec_tgt, dec_tgt_len) in enumerate(dec_targets):
+                _, loss_t = self.model(enc_src, enc_src_len, dec_tgt, dec_tgt_len, prefix_len=prefix_len, task=self.task, target_idx=t)
+                total_loss = total_loss + loss_t
+                per_target_losses.append(loss_t)
+            loss = total_loss / n_targets
 
         self.stats["loss"].append(loss.item())
+        if n_targets > 1:
+            names = getattr(self.env, "target_names", None)
+            for t, loss_t in enumerate(per_target_losses):
+                name = names[t] if names and names[t] is not None else str(t)
+                key = f"loss_{name}"
+                self.stats.setdefault(key, [])
+                self.stats[key].append(loss_t.item())
 
         # optimize
         self.optimize(loss)

@@ -89,15 +89,15 @@ class RNNModel(BaseModel):
         _output, hidden = self.encoder(src, src_len)
         return hidden, None
 
-    def _decode_train(self, task, dec_input, dec_input_len, src_enc, src_mask):
+    def _decode_train(self, task, dec_input, dec_input_len, src_enc, src_mask, target_idx=0):
         logits, _hidden = self.decoder(dec_input, dec_input_len, hidden=src_enc)
         return logits
 
-    def _prefill(self, task, gen_prefix, gen_prefix_len, max_new_tokens, src_enc, src_mask):
+    def _prefill(self, task, gen_prefix, gen_prefix_len, max_new_tokens, src_enc, src_mask, target_idx=0):
         logits, hidden = self.decoder(gen_prefix, gen_prefix_len, hidden=src_enc)
         return logits, hidden
 
-    def _generate_step(self, task, token, token_len, src_enc, src_mask, gen_state):
+    def _generate_step(self, task, token, token_len, src_enc, src_mask, gen_state, target_idx=0):
         logits, hidden = self.decoder(token, token_len, hidden=gen_state)
         return logits, hidden
 
