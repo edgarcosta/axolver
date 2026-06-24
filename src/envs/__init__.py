@@ -1,5 +1,6 @@
 from src.envs.environment import Environment
 from src.envs.ops.arithmetic import OPERATIONS as _arithmetic
+from src.envs.ops.cy_polytope import OPERATIONS as _cy_polytope
 from src.envs.ops.graph import OPERATIONS as _graph
 from src.envs.ops.integration import OPERATIONS as _integration
 from src.envs.ops.matrix import OPERATIONS as _matrix
@@ -8,6 +9,7 @@ from src.envs.ops.synthetic import OPERATIONS as _synthetic
 
 REGISTRY = {}
 REGISTRY.update(_arithmetic)
+REGISTRY.update(_cy_polytope)
 REGISTRY.update(_graph)
 REGISTRY.update(_integration)
 REGISTRY.update(_matrix)
