@@ -101,6 +101,25 @@ class BaseModel(nn.Module):
         loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=self.pad_index)
         return logits, loss
 
+    def multi_forward(self, enc_problem, enc_problem_len, dec_tgt_dict, dec_tgt_len_dict, prefix_len_dict):
+        """Encoder runs once; each decoder head in dec_tgt_dict is applied independently. Returns dict[task -> loss]."""
+        assert self.architecture == "encoder_decoder"
+        src_enc, src_mask = self._encode(enc_problem, enc_problem_len)
+        losses = {}
+        for task, dec_tgt in dec_tgt_dict.items():
+            dec_tgt_len = dec_tgt_len_dict[task]
+            dec_input = dec_tgt[:, :-1]
+            logits = self._decode_train(task, dec_input, dec_tgt_len - 1, src_enc, src_mask)
+            targets = dec_tgt[:, 1:]
+            prefix_len = prefix_len_dict.get(task)
+            if prefix_len is not None and (prefix_len > 1).any():
+                arange = torch.arange(targets.size(1), device=targets.device).unsqueeze(0)
+                input_mask = arange < (prefix_len - 1).unsqueeze(1)
+                targets = targets.clone()
+                targets[input_mask] = self.pad_index
+            losses[task] = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=self.pad_index)
+        return losses
+
     @torch.no_grad()
     def decode(self, enc_problem, enc_problem_len, max_output_len):
         assert self.architecture == "encoder_only"

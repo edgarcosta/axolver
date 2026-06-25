@@ -116,13 +116,25 @@ class Trainer:
         # reload potential checkpoints
         self.reload_checkpoint()
 
-        # reload exported data
+        # freeze encoder if requested (applied after checkpoint reload)
+        if getattr(params, "freeze_encoder", False):
+            enc = getattr(_unwrap_model(self.model), "encoder", None)
+            if enc is not None:
+                enc.requires_grad_(False)
+                logger.info("Encoder parameters frozen.")
+
+        # parse reload_data: supports both "task:path" and "task1:path1;task2:path2"
         self.data_path = None
+        self.aux_data_paths = {}
         if params.reload_data != "":
-            task_name, path = params.reload_data.split(":")
-            assert task_name == self.task, f"Task '{task_name}' in reload_data does not match task '{self.task}'"
-            assert os.path.isfile(path), f"Data file not found: {path}"
-            self.data_path = path
+            for pair in params.reload_data.split(";"):
+                pair = pair.strip()
+                task_name, path = pair.split(":", 1)
+                assert os.path.isfile(path), f"Data file not found: {path}"
+                if task_name == self.task:
+                    self.data_path = path
+                else:
+                    self.aux_data_paths[task_name] = path
 
         # open export files if needed
         self.export_files = {}
@@ -130,11 +142,20 @@ class Trainer:
             export_path = os.path.join(params.dump_path, f"{self.task}.data.prefix")
             self.export_files[self.task] = open(export_path, "w")
 
-        # create data loader
+        # validate that every decoder_task has a data path
+        decoder_tasks = [t.strip() for t in params.decoder_tasks.split(",") if t.strip()] if getattr(params, "decoder_tasks", "") else []
+        missing_paths = [t for t in decoder_tasks if t not in self.aux_data_paths]
+        if missing_paths:
+            raise ValueError(f"--decoder_tasks specifies {missing_paths} but no data path found in --reload_data for those tasks")
+
+        # create data loader(s)
+        self.aux_dataloaders = {}
         if not params.eval_only:
             if params.env_base_seed < 0:
                 params.env_base_seed = np.random.randint(1_000_000_000)
             self.dataloader = iter(create_train_iterator(self.env, self.task, self.data_path, params))
+            for aux_task, aux_path in self.aux_data_paths.items():
+                self.aux_dataloaders[aux_task] = iter(create_train_iterator(self.env, aux_task, aux_path, params))
 
     def optimize(self, loss):
         if (loss != loss).data.any():
@@ -185,15 +206,19 @@ class Trainer:
         self.n_equations = 0
         self.model.train()
 
+    def _decoder_labels(self):
+        """Return ordered list of decoder labels: [task, aux_task1, aux_task2, ...]."""
+        decoder_tasks = [t.strip() for t in self.params.decoder_tasks.split(",") if t.strip()] if getattr(self.params, "decoder_tasks", "") else []
+        return [self.task] + decoder_tasks
+
     def save_checkpoint(self, name):
         if not self.params.is_master:
             return
 
-        path = os.path.join(self.params.dump_path, f"{name}.pth")
-        logger.info(f"Saving {name} to {path} ...")
+        model = _unwrap_model(self.model)
+        full_sd = model.state_dict()
 
-        data = {
-            "model": _unwrap_model(self.model).state_dict(),
+        meta = {
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict() if self.scheduler else None,
             "scaler": self.scaler.state_dict(),
@@ -204,24 +229,80 @@ class Trainer:
             "decrease_counts": getattr(self, "decrease_counts", 0),
             "params": {k: v for k, v in self.params.__dict__.items()},
         }
-        torch.save(data, path)
+
+        # Encoder
+        enc_sd = {k[len("encoder."):]: v for k, v in full_sd.items() if k.startswith("encoder.")}
+        enc_path = os.path.join(self.params.dump_path, f"{name}-encoder.pth")
+        logger.info(f"Saving encoder to {enc_path}")
+        torch.save({"model": enc_sd, **meta}, enc_path)
+
+        # One file per decoder
+        labels = self._decoder_labels()
+        for label in labels:
+            prefix = "decoder." if label == self.task else f"aux_decoders.{label}."
+            dec_sd = {k[len(prefix):]: v for k, v in full_sd.items() if k.startswith(prefix)}
+            dec_path = os.path.join(self.params.dump_path, f"{name}-decoder-{label}.pth")
+            logger.info(f"Saving decoder '{label}' to {dec_path}")
+            torch.save({"model": dec_sd, **meta}, dec_path)
+
+    def _load_sd_filtered(self, model, ckpt_sd, prefix=""):
+        """Load ckpt_sd into model, skipping shape mismatches. Logs what was skipped/missing."""
+        current_sd = model.state_dict()
+        to_load = {k: v for k, v in ckpt_sd.items() if k in current_sd and v.shape == current_sd[k].shape}
+        skipped = [f"{prefix}{k}" for k in ckpt_sd if k not in to_load]
+        missing = [f"{prefix}{k}" for k in current_sd if k not in ckpt_sd]
+        model.load_state_dict(to_load, strict=False)
+        if skipped:
+            logger.warning(f"Checkpoint keys skipped (shape mismatch or not in model): {skipped}")
+        if missing:
+            logger.warning(f"Keys not in checkpoint (randomly initialized): {missing}")
 
     def reload_checkpoint(self):
-        auto_path = os.path.join(self.params.dump_path, "checkpoint.pth")
-        if os.path.isfile(auto_path):
-            checkpoint_path = auto_path
-        elif self.params.reload_checkpoint != "":
-            checkpoint_path = self.params.reload_checkpoint
-            assert os.path.isfile(checkpoint_path)
+        dump = self.params.dump_path
+        auto_enc = os.path.join(dump, "checkpoint-encoder.pth")
+        explicit = self.params.reload_checkpoint
+
+        if os.path.isfile(auto_enc):
+            # Multifile layout: load encoder + each decoder from separate files
+            logger.info(f"Reloading multifile checkpoint from {dump} ...")
+            model = _unwrap_model(self.model)
+            enc_data = torch.load(auto_enc, map_location="cpu", weights_only=False)
+            self._load_sd_filtered(model.encoder, enc_data["model"], prefix="encoder.")
+            for label in self._decoder_labels():
+                dec_path = os.path.join(dump, f"checkpoint-decoder-{label}.pth")
+                if not os.path.isfile(dec_path):
+                    logger.warning(f"Decoder checkpoint not found, skipping: {dec_path}")
+                    continue
+                dec_data = torch.load(dec_path, map_location="cpu", weights_only=False)
+                dec_module = model.decoder if label == self.task else model.aux_decoders.get(label)
+                if dec_module is None:
+                    logger.warning(f"No decoder module for label '{label}', skipping.")
+                    continue
+                self._load_sd_filtered(dec_module, dec_data["model"], prefix=f"decoder[{label}].")
+            data = enc_data  # use encoder file for training state
+        elif explicit != "":
+            # Single-file layout (old checkpoints or cross-experiment reload)
+            assert os.path.isfile(explicit), f"Checkpoint not found: {explicit}"
+            logger.info(f"Reloading checkpoint from {explicit} ...")
+            data = torch.load(explicit, map_location="cpu", weights_only=False)
+            model = _unwrap_model(self.model)
+            current_sd = model.state_dict()
+            ckpt_sd = data["model"]
+            to_load = {k: v for k, v in ckpt_sd.items() if k in current_sd and v.shape == current_sd[k].shape}
+            skipped = [k for k in ckpt_sd if k not in to_load]
+            missing = [k for k in current_sd if k not in to_load]
+            model.load_state_dict(to_load, strict=False)
+            if skipped:
+                logger.warning(f"Checkpoint keys skipped (shape mismatch or not in model): {skipped}")
+            if missing:
+                logger.warning(f"Keys not in checkpoint (randomly initialized): {missing}")
         else:
             return
 
-        logger.info(f"Reloading checkpoint from {checkpoint_path} ...")
-        data = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-
-        _unwrap_model(self.model).load_state_dict(data["model"])
-
-        self.optimizer.load_state_dict(data["optimizer"])
+        try:
+            self.optimizer.load_state_dict(data["optimizer"])
+        except (ValueError, KeyError, RuntimeError) as e:
+            logger.warning(f"Could not load optimizer state (starting fresh): {e}")
         if self.scheduler is not None and data.get("scheduler") is not None:
             self.scheduler.load_state_dict(data["scheduler"])
         if "scaler" in data:
@@ -301,13 +382,41 @@ class Trainer:
             f.close()
         self.export_files = {}
 
+    def _fetch_batch_to_device(self, device):
+        (enc_src, enc_src_len), (dec_tgt, dec_tgt_len), prefix_len = self.get_batch()
+        non_blocking = device in ("cuda", "xpu")
+        if enc_src is not None:
+            enc_src = enc_src.to(device, non_blocking=non_blocking)
+        if enc_src_len is not None:
+            enc_src_len = enc_src_len.to(device, non_blocking=non_blocking)
+        dec_tgt = dec_tgt.to(device, non_blocking=non_blocking)
+        dec_tgt_len = dec_tgt_len.to(device, non_blocking=non_blocking)
+        prefix_len = prefix_len.to(device, non_blocking=non_blocking)
+        return (enc_src, enc_src_len), (dec_tgt, dec_tgt_len), prefix_len
+
+    def _fetch_aux_batch_to_device(self, aux_task, device):
+        loader = self.aux_dataloaders[aux_task]
+        try:
+            batch = next(loader)
+        except StopIteration:
+            self.aux_dataloaders[aux_task] = iter(create_train_iterator(self.env, aux_task, self.aux_data_paths[aux_task], self.params))
+            batch = next(self.aux_dataloaders[aux_task])
+        _, (dec_tgt, dec_tgt_len), prefix_len = batch
+        non_blocking = device in ("cuda", "xpu")
+        return (
+            dec_tgt.to(device, non_blocking=non_blocking),
+            dec_tgt_len.to(device, non_blocking=non_blocking),
+            prefix_len.to(device, non_blocking=non_blocking),
+        )
+
     def enc_dec_step(self):
         params = self.params
         device = params.device
+        decoder_tasks = [t.strip() for t in params.decoder_tasks.split(",") if t.strip()] if getattr(params, "decoder_tasks", "") else []
 
-        (enc_src, enc_src_len), (dec_tgt, dec_tgt_len), prefix_len = self.get_batch()
-
+        (enc_src, enc_src_len), (dec_tgt, dec_tgt_len), prefix_len = self._fetch_batch_to_device(device)
         bs = dec_tgt_len.size(0)
+
         if params.architecture == "decoder_only":
             n_tokens = (dec_tgt_len - 1).sum().item()
         elif params.architecture == "encoder_only":
@@ -315,23 +424,45 @@ class Trainer:
         else:
             n_tokens = (enc_src_len + dec_tgt_len - 2).sum().item()
 
-        non_blocking = device == "cuda"
-        if enc_src is not None:
-            enc_src = enc_src.to(device, non_blocking=non_blocking)
-        if enc_src_len is not None:
-            enc_src_len = enc_src_len.to(device, non_blocking=non_blocking)
-        dec_tgt, dec_tgt_len = dec_tgt.to(device, non_blocking=non_blocking), dec_tgt_len.to(device, non_blocking=non_blocking)
-        prefix_len = prefix_len.to(device, non_blocking=non_blocking)
+        if not decoder_tasks:
+            # Single-decoder path (original behaviour)
+            with self.ctx:
+                _, loss = self.model(enc_src, enc_src_len, dec_tgt, dec_tgt_len, prefix_len=prefix_len, task=self.task)
+            self.stats["loss"].append(loss.item())
+            self.optimize(loss)
+        else:
+            # Multi-decoder path: encoder runs once, all decoder heads share its output
+            dec_tgt_dict = {self.task: dec_tgt}
+            dec_tgt_len_dict = {self.task: dec_tgt_len}
+            prefix_len_dict = {self.task: prefix_len}
+            for aux_task in decoder_tasks:
+                aux_dec_tgt, aux_dec_tgt_len, aux_prefix_len = self._fetch_aux_batch_to_device(aux_task, device)
+                dec_tgt_dict[aux_task] = aux_dec_tgt
+                dec_tgt_len_dict[aux_task] = aux_dec_tgt_len
+                prefix_len_dict[aux_task] = aux_prefix_len
 
-        with self.ctx:
-            _, loss = self.model(enc_src, enc_src_len, dec_tgt, dec_tgt_len, prefix_len=prefix_len, task=self.task)
+            # Build per-task loss weights
+            all_tasks = [self.task] + decoder_tasks
+            weights_str = getattr(params, "decoder_loss_weights", "")
+            if weights_str:
+                raw_w = [float(w.strip()) for w in weights_str.split(",") if w.strip()]
+                raw_w = (raw_w + [1.0] * len(all_tasks))[: len(all_tasks)]
+            else:
+                raw_w = [1.0] * len(all_tasks)
+            weight_map = dict(zip(all_tasks, raw_w))
 
-        self.stats["loss"].append(loss.item())
+            with self.ctx:
+                losses = _unwrap_model(self.model).multi_forward(enc_src, enc_src_len, dec_tgt_dict, dec_tgt_len_dict, prefix_len_dict)
 
-        # optimize
-        self.optimize(loss)
+            total_loss = sum(weight_map[t] * l for t, l in losses.items())
+            self.stats["loss"].append(total_loss.item())
+            for t, l in losses.items():
+                key = f"loss_{t}"
+                if key not in self.stats:
+                    self.stats[key] = []
+                self.stats[key].append(l.item())
+            self.optimize(total_loss)
 
-        # number of processed sequences / words
         self.n_equations += bs
         self.stats["processed_sequences"] += bs
         self.stats["processed_tokens"] += n_tokens

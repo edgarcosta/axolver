@@ -95,7 +95,10 @@ def get_parser():
 
     # export data / reload it
     parser.add_argument("--export_data", type=bool_flag, default=False, help="Export data and disable training.")
-    parser.add_argument("--reload_data", type=str, default="", help="Data path. Format: task:path. If empty, data is generated on the fly.")
+    parser.add_argument(
+        "--reload_data", type=str, default="",
+        help="Data path(s). Single decoder: 'task:path'. Multi-decoder: 'task1:path1;task2:path2'. If empty, data is generated on the fly.",
+    )
     parser.add_argument("--reload_size", type=int, default=-1, help="Reloaded training set size (-1 for everything, >0 enables batch loading)")
     parser.add_argument(
         "--index_dataset", type=bool_flag, default=False, help="Index the dataset and access it when needed instead of loading all on the RAM"
@@ -124,6 +127,23 @@ def get_parser():
         help="Length penalty, values < 1.0 favor shorter sentences, while values > 1.0 favor longer ones.",
     )
 
+    # multi-decoder configuration
+    parser.add_argument(
+        "--decoder_tasks", type=str, default="",
+        help="Comma-separated auxiliary decoder task names for multi-head decoding (e.g. 'cy_h11,cy_h21'). "
+             "Each task needs a corresponding entry in --reload_data (semicolon-separated).",
+    )
+    parser.add_argument(
+        "--n_dec_layers_per_task", type=str, default="",
+        help="Comma-separated n_dec_layers overrides for each auxiliary decoder (matching --decoder_tasks order). "
+             "Falls back to --n_dec_layers for unspecified entries.",
+    )
+    parser.add_argument(
+        "--decoder_loss_weights", type=str, default="",
+        help="Comma-separated loss weights for [primary, aux1, aux2, ...] decoders. Default: 1.0 each.",
+    )
+    parser.add_argument("--freeze_encoder", type=bool_flag, default=False, help="Freeze encoder weights (for decoder fine-tuning).")
+
     # reload checkpoint
     parser.add_argument("--reload_checkpoint", type=str, default="", help="Reload from a checkpoint")
 
@@ -132,6 +152,10 @@ def get_parser():
     parser.add_argument("--eval_only", type=bool_flag, default=False, help="Only run evaluations")
     parser.add_argument("--eval_from_exp", type=str, default="", help="Path of experiment to use")
     parser.add_argument("--eval_data", type=str, default="", help="Path of data to eval")
+    parser.add_argument(
+        "--eval_data_aux", type=str, default="",
+        help="Eval data for auxiliary decoder tasks. Format: 'task1:path1;task2:path2'.",
+    )
     parser.add_argument("--eval_verbose", type=int, default=0, help="Export evaluation details")
     parser.add_argument(
         "--decouple_cpu_gpu", type=bool_flag, default=False, help="Overlap GPU generation with CPU hypothesis checking during evaluation"

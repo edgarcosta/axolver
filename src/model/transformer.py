@@ -1,3 +1,4 @@
+import copy
 import math
 from logging import getLogger
 
@@ -353,8 +354,31 @@ class TransformerModel(BaseModel):
             self.encoder = TransformerBackbone(params, is_encoder=True, with_output=(self.architecture == "encoder_only"))
         if self.architecture in ("decoder_only", "encoder_decoder"):
             self.decoder = TransformerBackbone(params, is_encoder=False, with_output=True)
+            decoder_tasks = self._split_csv(getattr(params, "decoder_tasks", ""))
+            if decoder_tasks:
+                n_layers_list = self._parse_int_list(getattr(params, "n_dec_layers_per_task", ""), len(decoder_tasks), params.n_dec_layers)
+                self.aux_decoders = nn.ModuleDict()
+                for task_name, n_layers in zip(decoder_tasks, n_layers_list):
+                    p = copy.copy(params)
+                    p.n_dec_layers = n_layers
+                    self.aux_decoders[task_name] = TransformerBackbone(p, is_encoder=False, with_output=True)
+                    logger.info(f"Auxiliary decoder '{task_name}': {n_layers} layers, "
+                                f"{sum(q.numel() for q in self.aux_decoders[task_name].parameters())} params")
+
+    @staticmethod
+    def _split_csv(s):
+        return [t.strip() for t in s.split(",") if t.strip()] if s else []
+
+    @staticmethod
+    def _parse_int_list(s, n, default):
+        if not s:
+            return [default] * n
+        vals = [int(x.strip()) for x in s.split(",") if x.strip()]
+        return (vals + [default] * n)[:n]
 
     def _get_decoder(self, task):
+        if hasattr(self, "aux_decoders") and task in self.aux_decoders:
+            return self.aux_decoders[task]
         return self.decoder
 
     def _init_kv_cache(self, decoder, batch_size, max_len):

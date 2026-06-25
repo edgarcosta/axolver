@@ -199,9 +199,24 @@ class Evaluator:
 
         for data_type in data_type_list:
             self.enc_dec_step(data_type, self.task, scores)
+
+        # Evaluate auxiliary decoder heads if configured
+        decoder_tasks = [t.strip() for t in self.params.decoder_tasks.split(",") if t.strip()] if getattr(self.params, "decoder_tasks", "") else []
+        aux_eval_paths = {}
+        eval_data_aux = getattr(self.params, "eval_data_aux", "")
+        if eval_data_aux:
+            for pair in eval_data_aux.split(";"):
+                pair = pair.strip()
+                task_name, path = pair.split(":", 1)
+                aux_eval_paths[task_name] = path
+        for aux_task in decoder_tasks:
+            if aux_task in aux_eval_paths:
+                for data_type in data_type_list:
+                    self.enc_dec_step(data_type, aux_task, scores, eval_data_path=aux_eval_paths[aux_task])
+
         return scores
 
-    def enc_dec_step(self, data_type, task, scores):
+    def enc_dec_step(self, data_type, task, scores, eval_data_path=None):
         params = self.params
         env = self.env
         decoder_only = params.architecture == "decoder_only"
@@ -252,8 +267,9 @@ class Evaluator:
             "metrics_sum": {},
             "metrics_count": {},
         }
+        _eval_path_str = eval_data_path if eval_data_path is not None else params.eval_data
         iterator = create_test_iterator(
-            env, task, data_type, data_path=params.eval_data.split(",") if params.eval_data != "" else None, params=params
+            env, task, data_type, data_path=_eval_path_str.split(",") if _eval_path_str != "" else None, params=params
         )
         eval_size = len(iterator.dataset)
 
