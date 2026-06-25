@@ -142,8 +142,15 @@ def get_parser():
 
 
 def main(params):
-    # CPU / CUDA / MPS
-    params.device = "cpu" if params.cpu else ("mps" if torch.backends.mps.is_available() else "cuda")
+    # CPU / XPU / CUDA / MPS
+    if params.cpu:
+        params.device = "cpu"
+    elif torch.xpu.is_available():
+        params.device = "xpu"
+    elif torch.backends.mps.is_available():
+        params.device = "mps"
+    else:
+        params.device = "cuda"
     if params.device == "cuda":
         assert torch.cuda.is_available(), "CUDA requested but not available"
     elif params.device == "mps":
@@ -198,6 +205,10 @@ def main(params):
             logger.info(
                 f"Memory allocated: {torch.mps.current_allocated_memory()/(1024*1024):.2f}MB, reserved: {torch.mps.driver_allocated_memory()/(1024*1024):.2f}MB"
             )
+        elif params.device == "xpu":
+            logger.info(
+                f"Memory allocated: {torch.xpu.memory_allocated(0)/(1024*1024):.2f}MB, reserved: {torch.xpu.memory_reserved(0)/(1024*1024):.2f}MB"
+            )
 
         logger.info(f"============ End of epoch {trainer.epoch} ============")
 
@@ -210,6 +221,10 @@ def main(params):
         elif params.device == "mps":
             logger.info(
                 f"Memory allocated: {torch.mps.current_allocated_memory()/(1024*1024):.2f}MB, reserved: {torch.mps.driver_allocated_memory()/(1024*1024):.2f}MB"
+            )
+        elif params.device == "xpu":
+            logger.info(
+                f"Memory allocated: {torch.xpu.memory_allocated(0)/(1024*1024):.2f}MB, reserved: {torch.xpu.memory_reserved(0)/(1024*1024):.2f}MB"
             )
 
         if params.is_master:
