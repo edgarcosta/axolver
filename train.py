@@ -146,6 +146,8 @@ def get_parser():
 
     # reload checkpoint
     parser.add_argument("--reload_checkpoint", type=str, default="", help="Reload from a checkpoint")
+    parser.add_argument("--reload_encoder_checkpoint", type=str, default="", help="Reload encoder from a specific checkpoint file (overrides --reload_checkpoint for encoder)")
+    parser.add_argument("--reload_decoder_checkpoint", type=str, default="", help="Reload decoder from a specific checkpoint file (overrides --reload_checkpoint for decoder)")
 
     # evaluation
     parser.add_argument("--metrics_eval", type=str, default="", help="Metrics to compute during evaluation. Format: metric1,metric2.")

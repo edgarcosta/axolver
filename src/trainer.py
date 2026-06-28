@@ -261,8 +261,29 @@ class Trainer:
         dump = self.params.dump_path
         auto_enc = os.path.join(dump, "checkpoint-encoder.pth")
         explicit = self.params.reload_checkpoint
+        explicit_enc = getattr(self.params, "reload_encoder_checkpoint", "")
+        explicit_dec = getattr(self.params, "reload_decoder_checkpoint", "")
 
-        if os.path.isfile(auto_enc):
+        if explicit_enc != "" or explicit_dec != "":
+            # Mixed-source: load encoder and decoder from separate explicit paths
+            model = _unwrap_model(self.model)
+            data = None
+            if explicit_enc != "":
+                assert os.path.isfile(explicit_enc), f"Encoder checkpoint not found: {explicit_enc}"
+                logger.info(f"Reloading encoder from {explicit_enc} ...")
+                enc_data = torch.load(explicit_enc, map_location="cpu", weights_only=False)
+                self._load_sd_filtered(model.encoder, enc_data["model"], prefix="encoder.")
+                data = enc_data
+            if explicit_dec != "":
+                assert os.path.isfile(explicit_dec), f"Decoder checkpoint not found: {explicit_dec}"
+                logger.info(f"Reloading decoder from {explicit_dec} ...")
+                dec_data = torch.load(explicit_dec, map_location="cpu", weights_only=False)
+                self._load_sd_filtered(model.decoder, dec_data["model"], prefix=f"decoder[{self.task}].")
+                if data is None:
+                    data = dec_data
+            if data is None:
+                return
+        elif os.path.isfile(auto_enc):
             # Multifile layout: load encoder + each decoder from separate files
             logger.info(f"Reloading multifile checkpoint from {dump} ...")
             model = _unwrap_model(self.model)
