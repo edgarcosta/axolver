@@ -121,6 +121,8 @@ class Trainer:
             enc = getattr(_unwrap_model(self.model), "encoder", None)
             if enc is not None:
                 enc.requires_grad_(False)
+                enc.eval()  # disable dropout so the frozen features are deterministic
+                self._frozen_encoder = enc
                 logger.info("Encoder parameters frozen.")
 
         # parse reload_data: supports both "task:path" and "task1:path1;task2:path2"
@@ -205,6 +207,9 @@ class Trainer:
     def reset_epoch_stats(self):
         self.n_equations = 0
         self.model.train()
+        # keep a frozen encoder in eval mode (model.train() would re-enable dropout)
+        if getattr(self, "_frozen_encoder", None) is not None:
+            self._frozen_encoder.eval()
 
     def _decoder_labels(self):
         """Return ordered list of decoder labels: [task, aux_task1, aux_task2, ...]."""
@@ -245,12 +250,23 @@ class Trainer:
             logger.info(f"Saving decoder '{label}' to {dec_path}")
             torch.save({"model": dec_sd, **meta}, dec_path)
 
-    def _load_sd_filtered(self, model, ckpt_sd, prefix=""):
-        """Load ckpt_sd into model, skipping shape mismatches. Logs what was skipped/missing."""
+    def _load_sd_filtered(self, model, ckpt_sd, prefix="", must_be_complete=False):
+        """Load ckpt_sd into model, skipping shape mismatches. Logs what was skipped/missing.
+
+        If must_be_complete is set, raise when anything fails to load -- used for a
+        frozen encoder, where a silently-skipped tensor (e.g. a vocab-size-mismatched
+        token embedding) would be frozen at random init and quietly cripple the model.
+        """
         current_sd = model.state_dict()
         to_load = {k: v for k, v in ckpt_sd.items() if k in current_sd and v.shape == current_sd[k].shape}
         skipped = [f"{prefix}{k}" for k in ckpt_sd if k not in to_load]
         missing = [f"{prefix}{k}" for k in current_sd if k not in ckpt_sd]
+        if must_be_complete and (skipped or missing):
+            raise ValueError(
+                f"Incomplete load into a frozen module: skipped={skipped}, missing={missing}. "
+                f"This usually means a vocabulary/shape mismatch between checkpoints; "
+                f"freezing would lock in randomly-initialized weights."
+            )
         model.load_state_dict(to_load, strict=False)
         if skipped:
             logger.warning(f"Checkpoint keys skipped (shape mismatch or not in model): {skipped}")
@@ -264,6 +280,20 @@ class Trainer:
         explicit_enc = getattr(self.params, "reload_encoder_checkpoint", "")
         explicit_dec = getattr(self.params, "reload_decoder_checkpoint", "")
 
+        # Only a genuine same-experiment auto-resume should adopt the donor's
+        # training clock (epoch / optimizer / scheduler / best-metrics). Any
+        # partial or cross-experiment warm-start starts from a fresh clock.
+        resume_state = False
+        freeze = getattr(self.params, "freeze_encoder", False)
+
+        # A local checkpoint in dump_path means this is a same-experiment resume
+        # (e.g. a SLURM requeue). It must take precedence over warm-start reload
+        # flags, otherwise the requeued job would re-warm-start and restart the
+        # decoder from epoch 0 instead of continuing where it left off.
+        if os.path.isfile(auto_enc) and (explicit_enc or explicit_dec or explicit):
+            logger.info("Local checkpoint found in dump_path; ignoring reload flags and resuming.")
+            explicit_enc = explicit_dec = explicit = ""
+
         if explicit_enc != "" or explicit_dec != "":
             # Mixed-source: load encoder and decoder from separate explicit paths
             model = _unwrap_model(self.model)
@@ -272,7 +302,7 @@ class Trainer:
                 assert os.path.isfile(explicit_enc), f"Encoder checkpoint not found: {explicit_enc}"
                 logger.info(f"Reloading encoder from {explicit_enc} ...")
                 enc_data = torch.load(explicit_enc, map_location="cpu", weights_only=False)
-                self._load_sd_filtered(model.encoder, enc_data["model"], prefix="encoder.")
+                self._load_sd_filtered(model.encoder, enc_data["model"], prefix="encoder.", must_be_complete=freeze)
                 data = enc_data
             if explicit_dec != "":
                 assert os.path.isfile(explicit_dec), f"Decoder checkpoint not found: {explicit_dec}"
@@ -301,23 +331,54 @@ class Trainer:
                     continue
                 self._load_sd_filtered(dec_module, dec_data["model"], prefix=f"decoder[{label}].")
             data = enc_data  # use encoder file for training state
+            resume_state = True  # genuine same-experiment auto-resume
         elif explicit != "":
-            # Single-file layout (old checkpoints or cross-experiment reload)
+            # Explicit single checkpoint: a full-model file, or an encoder/decoder
+            # shard saved with submodule-local (prefix-stripped) keys.
             assert os.path.isfile(explicit), f"Checkpoint not found: {explicit}"
-            logger.info(f"Reloading checkpoint from {explicit} ...")
-            data = torch.load(explicit, map_location="cpu", weights_only=False)
             model = _unwrap_model(self.model)
-            current_sd = model.state_dict()
-            ckpt_sd = data["model"]
-            to_load = {k: v for k, v in ckpt_sd.items() if k in current_sd and v.shape == current_sd[k].shape}
-            skipped = [k for k in ckpt_sd if k not in to_load]
-            missing = [k for k in current_sd if k not in to_load]
-            model.load_state_dict(to_load, strict=False)
-            if skipped:
-                logger.warning(f"Checkpoint keys skipped (shape mismatch or not in model): {skipped}")
-            if missing:
-                logger.warning(f"Keys not in checkpoint (randomly initialized): {missing}")
+            base = os.path.basename(explicit)
+            data = torch.load(explicit, map_location="cpu", weights_only=False)
+            if base.endswith("-encoder.pth"):
+                logger.info(f"Reloading encoder from {explicit} ...")
+                self._load_sd_filtered(model.encoder, data["model"], prefix="encoder.", must_be_complete=freeze)
+            elif "-decoder-" in base:
+                logger.info(f"Reloading decoder from {explicit} ...")
+                self._load_sd_filtered(model.decoder, data["model"], prefix=f"decoder[{self.task}].")
+            else:
+                logger.info(f"Reloading checkpoint from {explicit} ...")
+                current_sd = model.state_dict()
+                ckpt_sd = data["model"]
+                to_load = {k: v for k, v in ckpt_sd.items() if k in current_sd and v.shape == current_sd[k].shape}
+                if not to_load:
+                    raise ValueError(
+                        f"No parameters from {explicit} matched the model. This usually means an "
+                        f"encoder/decoder shard was passed to --reload_checkpoint; use "
+                        f"--reload_encoder_checkpoint / --reload_decoder_checkpoint instead."
+                    )
+                skipped = [k for k in ckpt_sd if k not in to_load]
+                missing = [k for k in current_sd if k not in to_load]
+                if freeze:
+                    enc_bad = [k for k in skipped + missing if k.startswith("encoder.")]
+                    if enc_bad:
+                        raise ValueError(
+                            f"freeze_encoder is set but these encoder tensors did not load from "
+                            f"{explicit} (would be frozen at random init): {enc_bad}. Likely a "
+                            f"vocabulary/shape mismatch between checkpoints."
+                        )
+                model.load_state_dict(to_load, strict=False)
+                if skipped:
+                    logger.warning(f"Checkpoint keys skipped (shape mismatch or not in model): {skipped}")
+                if missing:
+                    logger.warning(f"Keys not in checkpoint (randomly initialized): {missing}")
         else:
+            return
+
+        if not resume_state:
+            # Partial / cross-experiment warm-start: load weights only and keep a
+            # fresh training clock so the new run isn't polluted by the donor's
+            # epoch, optimizer moments, scheduler, or best-metric stopping state.
+            logger.info("Loaded weights only (fresh optimizer / epoch / best-metrics).")
             return
 
         try:
