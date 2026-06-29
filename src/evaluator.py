@@ -284,7 +284,6 @@ class Evaluator:
             bs = single_batch["bs"]
 
             greedy_valid = single_batch["greedy_valid"].sum().item()
-            logger.info(f"({single_batch['total_so_far']}/{eval_size}) Found {greedy_valid}/{bs} valid top-1 predictions.")
 
             n_perfect_match, batch_n_well_formed, valid, batch_metrics = _process_batch(
                 single_batch,
@@ -310,7 +309,8 @@ class Evaluator:
                     stats["metrics_sum"][k] = stats["metrics_sum"].get(k, 0.0) + v
                     stats["metrics_count"][k] = stats["metrics_count"].get(k, 0) + 1
 
-            logger.info(f"Found {valid.sum().item()}/{bs} solutions in hypotheses.")
+            hyp_valid = valid.sum().item()
+            logger.info(f"({single_batch['total_so_far']}/{eval_size}) top-1: {greedy_valid}/{bs}, hyp: {hyp_valid}/{bs}")
 
         with cpu_sink(process_and_accumulate, decouple=decouple) as sink:
             device = params.device
