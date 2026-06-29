@@ -59,7 +59,8 @@ fi
 # Auto-resume from existing run unless explicit checkpoint given or null requested
 EXISTING=$(ls -d "${DUMP_PATH}/${EXP_NAME}"/[0-9]*/ 2>/dev/null | sort -n | tail -1)
 if [ -z "$DEC_CHECKPOINT" ] && [ "$DEC_CHECKPOINT_ARG" != "null" ] && [ -n "$EXISTING" ]; then
-    ENC_CHECKPOINT="${EXISTING}checkpoint-encoder.pth"
+    # Don't override an explicitly-given encoder checkpoint (e.g. encoder-checkpoint=h11-h12)
+    [ -z "$ENC_CHECKPOINT_ARG" ] && ENC_CHECKPOINT="${EXISTING}checkpoint-encoder.pth"
     DEC_CHECKPOINT="${EXISTING}checkpoint-decoder-cy_polytope.pth"
 fi
 

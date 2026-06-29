@@ -310,15 +310,14 @@ class Trainer:
                 logger.info(f"Reloading decoder from {explicit_dec} ...")
                 dec_data = torch.load(explicit_dec, map_location="cpu", weights_only=False)
                 self._load_sd_filtered(model.decoder, dec_data["model"], prefix=f"decoder[{self.task}].")
-                if data is None:
-                    data = dec_data
+                data = dec_data  # prefer decoder state: its epoch is always current
             if data is None:
                 return
-            # If both checkpoints are from the same directory, treat as a genuine
-            # same-experiment resume and restore the full training state.
-            if explicit_enc and explicit_dec:
-                if os.path.dirname(explicit_enc) == os.path.dirname(explicit_dec):
-                    resume_state = True
+            # Decoder checkpoint is authoritative for training state: it always
+            # reflects the current run's epoch, optimizer, and scheduler, even
+            # when the encoder comes from a different (e.g. frozen) experiment.
+            if explicit_dec:
+                resume_state = True
         elif os.path.isfile(auto_enc):
             # Multifile layout: load encoder + each decoder from separate files
             logger.info(f"Reloading multifile checkpoint from {dump} ...")

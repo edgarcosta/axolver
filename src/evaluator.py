@@ -388,10 +388,12 @@ class Evaluator:
         scores[f"{data_type}_{task.upper()}_acc"] = 100.0 * _n_valid / _n_total
         scores[f"{data_type}_{task.upper()}_well_formed"] = 100.0 * (stats["n_perfect_match"] + stats["n_well_formed"]) / _n_total
 
+        per_class = {}
         for cid, total in stats["n_total"].items():
             valid_i = stats["n_valid"].get(cid, 0)
             scores[f"{data_type}_{task.upper()}_acc_{cid}"] = 100.0 * valid_i / total
-            logger.info(f"{cid}: {valid_i} / {total} ({100. * valid_i / total:.2f}%)")
+            per_class[cid] = f"{valid_i}/{total}"
+        logger.info(f"per-class: { {k: per_class[k] for k in sorted(per_class)} }")
 
         for metric_name, metric_sum in stats["metrics_sum"].items():
             if metric_name == "is_valid":
