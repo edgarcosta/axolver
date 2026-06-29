@@ -24,6 +24,8 @@ class CYGenerator(Generator):
 def build_cy_polytope(params):
     from src.envs.cy_environment import CYEnvironment
 
+    if not params.reload_data:
+        raise RuntimeError("CY data must be loaded from file: pass --reload_data cy_polytope:<path>")
     generator = CYGenerator()
     return CYEnvironment(params, generator=generator)
 

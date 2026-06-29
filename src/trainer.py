@@ -235,11 +235,12 @@ class Trainer:
             "params": {k: v for k, v in self.params.__dict__.items()},
         }
 
-        # Encoder
-        enc_sd = {k[len("encoder."):]: v for k, v in full_sd.items() if k.startswith("encoder.")}
-        enc_path = os.path.join(self.params.dump_path, f"{name}-encoder.pth")
-        logger.info(f"Saving encoder to {enc_path}")
-        torch.save({"model": enc_sd, **meta}, enc_path)
+        # Encoder (skip if frozen -- weights are unchanged)
+        if not self.params.freeze_encoder:
+            enc_sd = {k[len("encoder."):]: v for k, v in full_sd.items() if k.startswith("encoder.")}
+            enc_path = os.path.join(self.params.dump_path, f"{name}-encoder.pth")
+            logger.info(f"Saving encoder to {enc_path}")
+            torch.save({"model": enc_sd, **meta}, enc_path)
 
         # One file per decoder
         labels = self._decoder_labels()
@@ -313,6 +314,11 @@ class Trainer:
                     data = dec_data
             if data is None:
                 return
+            # If both checkpoints are from the same directory, treat as a genuine
+            # same-experiment resume and restore the full training state.
+            if explicit_enc and explicit_dec:
+                if os.path.dirname(explicit_enc) == os.path.dirname(explicit_dec):
+                    resume_state = True
         elif os.path.isfile(auto_enc):
             # Multifile layout: load encoder + each decoder from separate files
             logger.info(f"Reloading multifile checkpoint from {dump} ...")

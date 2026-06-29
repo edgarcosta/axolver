@@ -35,7 +35,9 @@ class Environment:
         self.query_index = params.query_index = 2
         self.ans_index = params.ans_index = 3
 
-        logger.info(f"words: {self.word2id}")
+        items = list(self.word2id.items())
+        excerpt = dict(items[:4] + [("...", "...")] + items[-4:])
+        logger.info(f"words ({len(self.word2id)}): {excerpt}")
 
     def input_to_infix(self, lst):
         return " ".join(lst)
