@@ -73,7 +73,7 @@ EXTRA_ARGS=""
 [ -n "$DEC_CHECKPOINT" ] && EXTRA_ARGS="$EXTRA_ARGS --reload_decoder_checkpoint ${DEC_CHECKPOINT}"
 
 # shellcheck disable=SC2086
-python train.py \
+python -u train.py \
   --task cy_polytope \
   --dump_path "${DUMP_PATH}" \
   --exp_name "${EXP_NAME}" \

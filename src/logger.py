@@ -28,7 +28,7 @@ def create_logger(filepath, rank):
     if filepath is not None:
         if rank > 0:
             filepath = f"{filepath}-{rank}"
-        file_handler = logging.FileHandler(filepath, "a")
+        file_handler = logging.StreamHandler(open(filepath, "a", buffering=1))
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(log_formatter)
 

@@ -66,7 +66,7 @@ esac
 module load cuda/13
 source ~/venv_axolver/bin/activate
 
-python train.py \
+python -u train.py \
   --task cy_polytope \
   --dump_path "${DUMP_PATH}" \
   --exp_name "${EXP_NAME}" \
