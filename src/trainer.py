@@ -344,18 +344,22 @@ class Trainer:
             model = _unwrap_model(self.model)
             enc_data = torch.load(auto_enc, map_location="cpu", weights_only=False)
             self._load_sd_filtered(model.encoder, enc_data["model"], prefix="encoder.")
-            for label in self._decoder_labels():
-                dec_path = os.path.join(dump, f"checkpoint-decoder-{label}.pth")
-                if not os.path.isfile(dec_path):
-                    logger.warning(f"Decoder checkpoint not found, skipping: {dec_path}")
-                    continue
-                dec_data = torch.load(dec_path, map_location="cpu", weights_only=False)
-                aux = getattr(model, "aux_decoders", {})
-                dec_module = model.decoder if label == self.primary_head else (aux[label] if label in aux else None)
-                if dec_module is None:
-                    logger.warning(f"No decoder module for label '{label}', skipping.")
-                    continue
-                self._load_sd_filtered(dec_module, dec_data["model"], prefix=f"decoder[{label}].")
+            ignore_dec = getattr(self.params, "ignore_decoder_checkpoint", False)
+            if ignore_dec:
+                logger.info("Ignoring existing decoder checkpoints (--ignore_decoder_checkpoint).")
+            else:
+                for label in self._decoder_labels():
+                    dec_path = os.path.join(dump, f"checkpoint-decoder-{label}.pth")
+                    if not os.path.isfile(dec_path):
+                        logger.warning(f"Decoder checkpoint not found, skipping: {dec_path}")
+                        continue
+                    dec_data = torch.load(dec_path, map_location="cpu", weights_only=False)
+                    aux = getattr(model, "aux_decoders", {})
+                    dec_module = model.decoder if label == self.primary_head else (aux[label] if label in aux else None)
+                    if dec_module is None:
+                        logger.warning(f"No decoder module for label '{label}', skipping.")
+                        continue
+                    self._load_sd_filtered(dec_module, dec_data["model"], prefix=f"decoder[{label}].")
             data = enc_data  # use encoder file for training state
             resume_state = True  # genuine same-experiment auto-resume
         elif explicit != "":
