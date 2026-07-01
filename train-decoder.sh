@@ -72,6 +72,24 @@ if [ -z "$DEC_CHECKPOINT" ] && [ "$DEC_CHECKPOINT_ARG" != "null" ] && [ -n "$EXI
     DEC_CHECKPOINT="${EXISTING}checkpoint-decoder-${PRIMARY}.pth"
 fi
 
+# Build the command
+set -- python -u train.py \
+  --task cy_polytope \
+  --dump_path "${DUMP_PATH}" \
+  --exp_name "${EXP_NAME}" \
+  --n_dec_layers 1 \
+  --max_len 320 \
+  --base 1000 \
+  --reload_data "${RELOAD_DATA}" \
+  --eval_data "${EVAL_DATA}" \
+  --test_data "${TEST_DATA}" \
+  --eval_size 5000 \
+  --amp true
+[ "$FROZEN" = "true" ]             && set -- "$@" --freeze_encoder true
+[ -n "$ENC_CHECKPOINT" ]           && set -- "$@" --reload_encoder_checkpoint "${ENC_CHECKPOINT}"
+[ -n "$DEC_CHECKPOINT" ]           && set -- "$@" --reload_decoder_checkpoint "${DEC_CHECKPOINT}"
+[ "$DEC_CHECKPOINT_ARG" = "null" ] && set -- "$@" --ignore_decoder_checkpoint true
+
 echo ""
 echo "=== Decoder Training ==="
 echo "  task:          cy_polytope (${TASK})	# task type and data variant"
@@ -99,6 +117,8 @@ elif [ -n "$DEC_CHECKPOINT" ]; then
 fi
 [ -n "$SLURM_JOB_ID" ] && echo "  slurm_job_id:  ${SLURM_JOB_ID}"
 echo ""
+echo "  command: $*"
+echo ""
 printf "Proceed? [y/N] "
 read CONFIRM
 case "$CONFIRM" in
@@ -109,23 +129,4 @@ esac
 module load cuda/13
 source ~/venv_axolver/bin/activate
 
-EXTRA_ARGS=""
-[ "$FROZEN" = "true" ]             && EXTRA_ARGS="$EXTRA_ARGS --freeze_encoder true"
-[ -n "$ENC_CHECKPOINT" ]           && EXTRA_ARGS="$EXTRA_ARGS --reload_encoder_checkpoint ${ENC_CHECKPOINT}"
-[ -n "$DEC_CHECKPOINT" ]           && EXTRA_ARGS="$EXTRA_ARGS --reload_decoder_checkpoint ${DEC_CHECKPOINT}"
-[ "$DEC_CHECKPOINT_ARG" = "null" ] && EXTRA_ARGS="$EXTRA_ARGS --ignore_decoder_checkpoint true"
-
-# shellcheck disable=SC2086
-python -u train.py \
-  --task cy_polytope \
-  --dump_path "${DUMP_PATH}" \
-  --exp_name "${EXP_NAME}" \
-  --n_dec_layers 1 \
-  --max_len 320 \
-  --base 1000 \
-  --reload_data "${RELOAD_DATA}" \
-  --eval_data "${EVAL_DATA}" \
-  --test_data "${TEST_DATA}" \
-  --eval_size 5000 \
-  --amp true \
-  $EXTRA_ARGS
+"$@"
