@@ -72,11 +72,15 @@ case "$CONFIRM" in
     *) echo "Aborted."; exit 0 ;;
 esac
 
-module load cuda/13
+if command -v module >/dev/null 2>&1; then
+    module load cuda/13
+fi
 source ~/venv_axolver/bin/activate
 
 EXTRA_ARGS=""
 [ "$FROZEN" = "true" ] && EXTRA_ARGS="$EXTRA_ARGS --freeze_encoder true"
+python3 -c "import torch; exit(0 if torch.cuda.is_available() or torch.xpu.is_available() or torch.backends.mps.is_available() else 1)" 2>/dev/null \
+    || EXTRA_ARGS="$EXTRA_ARGS --cpu true"
 
 # shellcheck disable=SC2086
 python -u train.py \
