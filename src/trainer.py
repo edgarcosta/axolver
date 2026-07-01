@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from torch.nn.utils import clip_grad_norm_
 
-from src.envs.environment import create_train_iterator
+from src.envs.environment import create_train_iterator, parse_column_spec
 from src.optim import get_optimizer
 
 logger = getLogger()
@@ -61,6 +61,14 @@ class Trainer:
         self.params = params
         self.env = env
         self.task = params.task
+
+        # Decoder heads (from the column spec, resolved into params.decoder_heads by
+        # train.py). First head is primary (model.decoder); the rest are aux_decoders.
+        # Legacy mode (no column spec) => a single head == the env task. Set before
+        # reload_checkpoint(), which uses self.heads / self.primary_head.
+        self.heads = list(getattr(params, "decoder_heads", []) or [self.task])
+        self.primary_head = self.heads[0]
+        self.head_weights = self._parse_head_weights()
 
         assert params.report_loss_every > 0
 
@@ -125,18 +133,16 @@ class Trainer:
                 self._frozen_encoder = enc
                 logger.info("Encoder parameters frozen.")
 
-        # parse reload_data: supports both "task:path" and "task1:path1;task2:path2"
+        # Column-mode training sources (one source = aligned multi-head; many = alternate).
+        self.sources = parse_column_spec(params.reload_data) if params.reload_data else None
+
+        # Legacy single-decoder data path: first "task:path" segment.
         self.data_path = None
-        self.aux_data_paths = {}
-        if params.reload_data != "":
-            for pair in params.reload_data.split(";"):
-                pair = pair.strip()
-                task_name, path = pair.split(":", 1)
-                assert os.path.isfile(path), f"Data file not found: {path}"
-                if task_name == self.task:
-                    self.data_path = path
-                else:
-                    self.aux_data_paths[task_name] = path
+        if self.sources is None and params.reload_data != "":
+            seg = params.reload_data.split(";")[0].strip()
+            _, path = seg.split(":", 1)
+            assert os.path.isfile(path), f"Data file not found: {path}"
+            self.data_path = path
 
         # open export files if needed
         self.export_files = {}
@@ -144,20 +150,35 @@ class Trainer:
             export_path = os.path.join(params.dump_path, f"{self.task}.data.prefix")
             self.export_files[self.task] = open(export_path, "w")
 
-        # validate that every decoder_task has a data path
-        decoder_tasks = [t.strip() for t in params.decoder_tasks.split(",") if t.strip()] if getattr(params, "decoder_tasks", "") else []
-        missing_paths = [t for t in decoder_tasks if t not in self.aux_data_paths]
-        if missing_paths:
-            raise ValueError(f"--decoder_tasks specifies {missing_paths} but no data path found in --reload_data for those tasks")
-
         # create data loader(s)
-        self.aux_dataloaders = {}
+        self.dataloaders = []
+        self._src_idx = 0
         if not params.eval_only:
             if params.env_base_seed < 0:
                 params.env_base_seed = np.random.randint(1_000_000_000)
-            self.dataloader = iter(create_train_iterator(self.env, self.task, self.data_path, params))
-            for aux_task, aux_path in self.aux_data_paths.items():
-                self.aux_dataloaders[aux_task] = iter(create_train_iterator(self.env, aux_task, aux_path, params))
+            if self.sources is not None:
+                # One loader per source. A single source trains all its heads from one
+                # encoder pass (aligned); multiple sources alternate per batch (no
+                # cross-source row alignment required).
+                for src in self.sources:
+                    for path in [src["path"]]:
+                        assert os.path.isfile(path), f"Data file not found: {path}"
+                    self.dataloaders.append(
+                        iter(create_train_iterator(self.env, self.task, src["path"], params, file_heads=src["heads"]))
+                    )
+                logger.info(f"Column-mode training: heads={self.heads}, sources={len(self.dataloaders)} "
+                            f"({'aligned' if len(self.dataloaders) == 1 else 'alternating'})")
+            else:
+                self.dataloader = iter(create_train_iterator(self.env, self.task, self.data_path, params))
+
+    def _parse_head_weights(self):
+        """Map each head to its loss weight from --decoder_loss_weights (positional, [primary, aux1, ...])."""
+        weights_str = getattr(self.params, "decoder_loss_weights", "")
+        if not weights_str:
+            return {h: 1.0 for h in self.heads}
+        raw = [float(w.strip()) for w in weights_str.split(",") if w.strip()]
+        raw = (raw + [1.0] * len(self.heads))[: len(self.heads)]
+        return dict(zip(self.heads, raw))
 
     def optimize(self, loss):
         if (loss != loss).data.any():
@@ -212,9 +233,8 @@ class Trainer:
             self._frozen_encoder.eval()
 
     def _decoder_labels(self):
-        """Return ordered list of decoder labels: [task, aux_task1, aux_task2, ...]."""
-        decoder_tasks = [t.strip() for t in self.params.decoder_tasks.split(",") if t.strip()] if getattr(self.params, "decoder_tasks", "") else []
-        return [self.task] + decoder_tasks
+        """Ordered list of decoder head labels (primary first, then aux heads)."""
+        return list(self.heads)
 
     def save_checkpoint(self, name):
         if not self.params.is_master:
@@ -245,7 +265,7 @@ class Trainer:
         # One file per decoder
         labels = self._decoder_labels()
         for label in labels:
-            prefix = "decoder." if label == self.task else f"aux_decoders.{label}."
+            prefix = "decoder." if label == self.primary_head else f"aux_decoders.{label}."
             dec_sd = {k[len(prefix):]: v for k, v in full_sd.items() if k.startswith(prefix)}
             dec_path = os.path.join(self.params.dump_path, f"{name}-decoder-{label}.pth")
             logger.info(f"Saving decoder '{label}' to {dec_path}")
@@ -330,7 +350,8 @@ class Trainer:
                     logger.warning(f"Decoder checkpoint not found, skipping: {dec_path}")
                     continue
                 dec_data = torch.load(dec_path, map_location="cpu", weights_only=False)
-                dec_module = model.decoder if label == self.task else model.aux_decoders.get(label)
+                aux = getattr(model, "aux_decoders", {})
+                dec_module = model.decoder if label == self.primary_head else (aux[label] if label in aux else None)
                 if dec_module is None:
                     logger.warning(f"No decoder module for label '{label}', skipping.")
                     continue
@@ -481,26 +502,12 @@ class Trainer:
         prefix_len = prefix_len.to(device, non_blocking=non_blocking)
         return (enc_src, enc_src_len), (dec_tgt, dec_tgt_len), prefix_len
 
-    def _fetch_aux_batch_to_device(self, aux_task, device):
-        loader = self.aux_dataloaders[aux_task]
-        try:
-            batch = next(loader)
-        except StopIteration:
-            self.aux_dataloaders[aux_task] = iter(create_train_iterator(self.env, aux_task, self.aux_data_paths[aux_task], self.params))
-            batch = next(self.aux_dataloaders[aux_task])
-        _, (dec_tgt, dec_tgt_len), prefix_len = batch
-        non_blocking = device in ("cuda", "xpu")
-        return (
-            dec_tgt.to(device, non_blocking=non_blocking),
-            dec_tgt_len.to(device, non_blocking=non_blocking),
-            prefix_len.to(device, non_blocking=non_blocking),
-        )
-
     def enc_dec_step(self):
+        if self.sources is not None:
+            return self._column_step()
+
         params = self.params
         device = params.device
-        decoder_tasks = [t.strip() for t in params.decoder_tasks.split(",") if t.strip()] if getattr(params, "decoder_tasks", "") else []
-
         (enc_src, enc_src_len), (dec_tgt, dec_tgt_len), prefix_len = self._fetch_batch_to_device(device)
         bs = dec_tgt_len.size(0)
 
@@ -511,44 +518,45 @@ class Trainer:
         else:
             n_tokens = (enc_src_len + dec_tgt_len - 2).sum().item()
 
-        if not decoder_tasks:
-            # Single-decoder path (original behaviour)
-            with self.ctx:
-                _, loss = self.model(enc_src, enc_src_len, dec_tgt, dec_tgt_len, prefix_len=prefix_len, task=self.task)
-            self.stats["loss"].append(loss.item())
-            self.optimize(loss)
-        else:
-            # Multi-decoder path: encoder runs once, all decoder heads share its output
-            dec_tgt_dict = {self.task: dec_tgt}
-            dec_tgt_len_dict = {self.task: dec_tgt_len}
-            prefix_len_dict = {self.task: prefix_len}
-            for aux_task in decoder_tasks:
-                aux_dec_tgt, aux_dec_tgt_len, aux_prefix_len = self._fetch_aux_batch_to_device(aux_task, device)
-                dec_tgt_dict[aux_task] = aux_dec_tgt
-                dec_tgt_len_dict[aux_task] = aux_dec_tgt_len
-                prefix_len_dict[aux_task] = aux_prefix_len
+        with self.ctx:
+            _, loss = self.model(enc_src, enc_src_len, dec_tgt, dec_tgt_len, prefix_len=prefix_len, task=self.primary_head)
+        self.stats["loss"].append(loss.item())
+        self.optimize(loss)
 
-            # Build per-task loss weights
-            all_tasks = [self.task] + decoder_tasks
-            weights_str = getattr(params, "decoder_loss_weights", "")
-            if weights_str:
-                raw_w = [float(w.strip()) for w in weights_str.split(",") if w.strip()]
-                raw_w = (raw_w + [1.0] * len(all_tasks))[: len(all_tasks)]
-            else:
-                raw_w = [1.0] * len(all_tasks)
-            weight_map = dict(zip(all_tasks, raw_w))
+        self.n_equations += bs
+        self.stats["processed_sequences"] += bs
+        self.stats["processed_tokens"] += n_tokens
 
-            with self.ctx:
-                losses = _unwrap_model(self.model).multi_forward(enc_src, enc_src_len, dec_tgt_dict, dec_tgt_len_dict, prefix_len_dict)
+    def _column_step(self):
+        """One training step in column mode. A single source trains all its heads from one
+        encoder pass (aligned); with multiple sources we round-robin per batch (alternating)."""
+        device = self.params.device
+        non_blocking = device in ("cuda", "xpu")
 
-            total_loss = sum(weight_map[t] * l for t, l in losses.items())
-            self.stats["loss"].append(total_loss.item())
-            for t, l in losses.items():
-                key = f"loss_{t}"
-                if key not in self.stats:
-                    self.stats[key] = []
-                self.stats[key].append(l.item())
-            self.optimize(total_loss)
+        loader = self.dataloaders[self._src_idx]
+        self._src_idx = (self._src_idx + 1) % len(self.dataloaders)
+        (enc_src, enc_src_len), head_targets = next(loader)
+
+        enc_src = enc_src.to(device, non_blocking=non_blocking)
+        enc_src_len = enc_src_len.to(device, non_blocking=non_blocking)
+        dec_tgt_dict, dec_tgt_len_dict, prefix_len_dict = {}, {}, {}
+        for h, (d, dl, pl) in head_targets.items():
+            dec_tgt_dict[h] = d.to(device, non_blocking=non_blocking)
+            dec_tgt_len_dict[h] = dl.to(device, non_blocking=non_blocking)
+            prefix_len_dict[h] = pl.to(device, non_blocking=non_blocking)
+
+        bs = enc_src_len.size(0)
+        any_len = next(iter(dec_tgt_len_dict.values()))
+        n_tokens = (enc_src_len + any_len - 2).sum().item()
+
+        with self.ctx:
+            losses = _unwrap_model(self.model).multi_forward(enc_src, enc_src_len, dec_tgt_dict, dec_tgt_len_dict, prefix_len_dict)
+
+        total_loss = sum(self.head_weights.get(h, 1.0) * l for h, l in losses.items())
+        self.stats["loss"].append(total_loss.item())
+        for h, l in losses.items():
+            self.stats.setdefault(f"loss_{h}", []).append(l.item())
+        self.optimize(total_loss)
 
         self.n_equations += bs
         self.stats["processed_sequences"] += bs

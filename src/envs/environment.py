@@ -81,13 +81,59 @@ class Environment:
         return metrics_dict
 
 
-def create_train_iterator(env, task, data_path, params):
+def parse_column_spec(spec):
+    """Parse a column-style data spec into a list of sources.
+
+    Form: 'p,h1,h2:path1;p,h3:path2'  (semicolons separate sources). Within a
+    source the comma-separated labels map 1:1 to the file's tab columns: the
+    first label is the problem/encoder column, the rest are decoder-head columns.
+
+    Returns a list of {"problem", "heads", "path"} dicts, or None when `spec` is
+    not in column form (callers then fall back to legacy "task:path" parsing).
+    A source is column-form iff it has a ':' and a ',' before that ':'. This
+    distinguishes new specs from legacy reload_data ("task:path", no comma) and
+    legacy eval_data ("valid,test", no colon).
     """
-    Create a dataset for this environment.
+    if not spec:
+        return None
+    segments = [s.strip() for s in spec.split(";") if s.strip()]
+
+    def is_col(seg):
+        return ":" in seg and "," in seg.split(":", 1)[0]
+
+    if not any(is_col(seg) for seg in segments):
+        return None
+    sources = []
+    for seg in segments:
+        assert is_col(seg), f"cannot mix legacy and column-spec data sources: {seg!r}"
+        labels_part, path = seg.split(":", 1)
+        labels = [x.strip() for x in labels_part.split(",") if x.strip()]
+        assert len(labels) >= 2, f"column source needs a problem label and >=1 head: {seg!r}"
+        sources.append({"problem": labels[0], "heads": labels[1:], "path": path.strip()})
+    return sources
+
+
+def heads_from_sources(sources):
+    """Ordered union of head labels across sources; the first element is the primary head."""
+    heads = []
+    for src in sources:
+        for h in src["heads"]:
+            if h not in heads:
+                heads.append(h)
+    return heads
+
+
+def create_train_iterator(env, task, data_path, params, file_heads=None):
+    """
+    Create a training dataset for this environment.
+
+    file_heads: ordered decoder-head labels matching the file's answer columns
+    (columns 1..K; column 0 is the problem). When given, the dataset runs in
+    column mode and emits one target per head, all from the same row.
     """
     logger.info(f"Creating train iterator for {task} ...")
 
-    dataset = EnvDataset(env, train=True, params=params, path=data_path)
+    dataset = EnvDataset(env, train=True, params=params, path=data_path, file_heads=file_heads)
     num_workers = params.num_workers if data_path is None else 0
     return DataLoader(
         dataset,
@@ -100,18 +146,25 @@ def create_train_iterator(env, task, data_path, params):
     )
 
 
-def create_test_iterator(env, task, data_type, data_path, params):
+def create_test_iterator(env, task, data_type, data_path, params, file_heads=None, expose_head=None):
     """
-    Create a dataset for this environment.
+    Create an eval/test dataset for this environment.
+
+    In column mode (file_heads given), data_path holds the single source path and
+    expose_head selects which column is scored as the answer for this pass.
     """
     logger.info(f"Creating {data_type} iterator for {task} ...")
 
     if data_path is None:
         path_iter = None
+    elif file_heads is not None:
+        path_iter = data_path[0]  # column mode: caller passes the single source path
     elif data_type == "valid":
         path_iter = data_path[0]
     else:
         assert data_type.startswith("test")
         path_iter = data_path[int(data_type[4:])]
-    dataset = EnvDataset(env, train=False, params=params, path=path_iter, size=params.eval_size)
+    dataset = EnvDataset(
+        env, train=False, params=params, path=path_iter, size=params.eval_size, file_heads=file_heads, expose_head=expose_head
+    )
     return DataLoader(dataset, timeout=0, batch_size=params.batch_size_eval, num_workers=0, shuffle=False, collate_fn=dataset.collate_fn)

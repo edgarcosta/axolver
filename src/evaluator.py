@@ -9,7 +9,7 @@ from logging import getLogger
 
 import torch
 
-from src.envs.environment import create_test_iterator
+from src.envs.environment import create_test_iterator, parse_column_spec
 from src.trainer import _unwrap_model
 
 logger = getLogger()
@@ -191,32 +191,44 @@ class Evaluator:
 
     def run_all_evals(self):
         scores = OrderedDict({"epoch": self.trainer.epoch})
+        params = self.params
 
+        valid_sources = parse_column_spec(params.eval_data)
+        test_sources = parse_column_spec(getattr(params, "test_data", ""))
+
+        if valid_sources is not None or test_sources is not None:
+            # Column mode: eval_data -> "valid", test_data -> "test1". If only one is
+            # given, use it for both. Each head is scored on the source that defines it.
+            if valid_sources is None:
+                valid_sources = test_sources
+            if test_sources is None:
+                test_sources = valid_sources
+            self._run_column_evals("valid", valid_sources, scores)
+            self._run_column_evals("test1", test_sources, scores)
+            return scores
+
+        # Legacy mode: eval_data is a comma-separated list "valid,test1,test2,...".
         data_type_list = ["valid"]
-        if self.params.eval_data != "":
-            for i in range(1, len(self.params.eval_data.split(","))):
+        if params.eval_data != "":
+            for i in range(1, len(params.eval_data.split(","))):
                 data_type_list.append(f"test{i}")
-
         for data_type in data_type_list:
             self.enc_dec_step(data_type, self.task, scores)
-
-        # Evaluate auxiliary decoder heads if configured
-        decoder_tasks = [t.strip() for t in self.params.decoder_tasks.split(",") if t.strip()] if getattr(self.params, "decoder_tasks", "") else []
-        aux_eval_paths = {}
-        eval_data_aux = getattr(self.params, "eval_data_aux", "")
-        if eval_data_aux:
-            for pair in eval_data_aux.split(";"):
-                pair = pair.strip()
-                task_name, path = pair.split(":", 1)
-                aux_eval_paths[task_name] = path
-        for aux_task in decoder_tasks:
-            if aux_task in aux_eval_paths:
-                for data_type in data_type_list:
-                    self.enc_dec_step(data_type, aux_task, scores, eval_data_path=aux_eval_paths[aux_task])
-
         return scores
 
-    def enc_dec_step(self, data_type, task, scores, eval_data_path=None):
+    def _run_column_evals(self, data_type, sources, scores):
+        head_to_src = {}
+        for src in sources:
+            for h in src["heads"]:
+                head_to_src.setdefault(h, src)
+        for h in self.trainer.heads:
+            if h in head_to_src:
+                src = head_to_src[h]
+                self.enc_dec_step(
+                    data_type, h, scores, eval_data_path=src["path"], file_heads=src["heads"], expose_head=h
+                )
+
+    def enc_dec_step(self, data_type, task, scores, eval_data_path=None, file_heads=None, expose_head=None):
         params = self.params
         env = self.env
         decoder_only = params.architecture == "decoder_only"
@@ -269,7 +281,9 @@ class Evaluator:
         }
         _eval_path_str = eval_data_path if eval_data_path is not None else params.eval_data
         iterator = create_test_iterator(
-            env, task, data_type, data_path=_eval_path_str.split(",") if _eval_path_str != "" else None, params=params
+            env, task, data_type,
+            data_path=_eval_path_str.split(",") if _eval_path_str != "" else None,
+            params=params, file_heads=file_heads, expose_head=expose_head,
         )
         eval_size = len(iterator.dataset)
 

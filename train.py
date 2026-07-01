@@ -127,20 +127,17 @@ def get_parser():
         help="Length penalty, values < 1.0 favor shorter sentences, while values > 1.0 favor longer ones.",
     )
 
-    # multi-decoder configuration
-    parser.add_argument(
-        "--decoder_tasks", type=str, default="",
-        help="Comma-separated auxiliary decoder task names for multi-head decoding (e.g. 'cy_h11,cy_h21'). "
-             "Each task needs a corresponding entry in --reload_data (semicolon-separated).",
-    )
+    # multi-decoder configuration. Heads are declared via the column spec in --reload_data
+    # (and --eval_data / --test_data), e.g. "cy_polytope,h11,h12:path": the first label is
+    # the problem/encoder column, the rest are decoder heads (first head = primary).
     parser.add_argument(
         "--n_dec_layers_per_task", type=str, default="",
-        help="Comma-separated n_dec_layers overrides for each auxiliary decoder (matching --decoder_tasks order). "
-             "Falls back to --n_dec_layers for unspecified entries.",
+        help="Comma-separated n_dec_layers overrides for the auxiliary decoder heads (all heads after the "
+             "first, in spec order). Falls back to --n_dec_layers for unspecified entries.",
     )
     parser.add_argument(
         "--decoder_loss_weights", type=str, default="",
-        help="Comma-separated loss weights for [primary, aux1, aux2, ...] decoders. Default: 1.0 each.",
+        help="Comma-separated loss weights for [primary, aux1, aux2, ...] decoder heads. Default: 1.0 each.",
     )
     parser.add_argument("--freeze_encoder", type=bool_flag, default=False, help="Freeze encoder weights (for decoder fine-tuning).")
 
@@ -153,10 +150,15 @@ def get_parser():
     parser.add_argument("--metrics_eval", type=str, default="", help="Metrics to compute during evaluation. Format: metric1,metric2.")
     parser.add_argument("--eval_only", type=bool_flag, default=False, help="Only run evaluations")
     parser.add_argument("--eval_from_exp", type=str, default="", help="Path of experiment to use")
-    parser.add_argument("--eval_data", type=str, default="", help="Path of data to eval")
     parser.add_argument(
-        "--eval_data_aux", type=str, default="",
-        help="Eval data for auxiliary decoder tasks. Format: 'task1:path1;task2:path2'.",
+        "--eval_data", type=str, default="",
+        help="Validation data. Legacy: comma-separated 'valid,test1,...'. Column spec: "
+             "'cy_polytope,h11,h12:path' (also accepts ';'-separated multi-source).",
+    )
+    parser.add_argument(
+        "--test_data", type=str, default="",
+        help="Test data in the same column-spec form as --eval_data. If only one of "
+             "--eval_data / --test_data is given, it is used for both.",
     )
     parser.add_argument("--eval_verbose", type=int, default=0, help="Export evaluation details")
     parser.add_argument(
@@ -189,6 +191,18 @@ def main(params):
     # initialize the multi-GPU / multi-node training
     init_distributed_mode(params)
     logger = initialize_exp(params)
+
+    # Resolve decoder heads from the first available column spec (reload_data, then
+    # eval_data, then test_data). Legacy (no column spec) => a single head == the task.
+    from src.envs.environment import parse_column_spec, heads_from_sources
+    params.decoder_heads = [params.task]
+    for spec in (params.reload_data, params.eval_data, getattr(params, "test_data", "")):
+        sources = parse_column_spec(spec)
+        if sources:
+            params.decoder_heads = heads_from_sources(sources)
+            break
+    params.primary_head = params.decoder_heads[0]
+    logger.info(f"Decoder heads: {params.decoder_heads} (primary: {params.primary_head})")
 
     # build environment / model / trainer / evaluator
     env = build_env(params)

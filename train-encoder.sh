@@ -18,12 +18,23 @@ if [ -z "$TASK" ]; then
     exit 1
 fi
 
+# A hyphenated task names multiple decoder heads: h11-h12 -> heads "h11,h12".
+# The data dir keeps the full task name (axolver-h11-h12-10M); its file columns
+# are [problem, <each head>]. The first head is the primary decoder.
+HEADS=$(echo "$TASK" | tr '-' ',')
+PRIMARY="${TASK%%-*}"
+DATADIR="../data/axolver-${TASK}-${SIZE}"
+
 DUMP_PATH="exp/CY-4d/encoder-${TASK}-${SIZE}"
 EXP_NAME="decoder-${TASK}"
-RELOAD_DATA="cy_polytope:../data/axolver-${TASK}-${SIZE}/train.data"
-EVAL_DATA="../data/axolver-${TASK}-${SIZE}/valid.data,../data/axolver-${TASK}-${SIZE}/test.data"
+RELOAD_DATA="cy_polytope,${HEADS}:${DATADIR}/train.data"
+EVAL_DATA="cy_polytope,${HEADS}:${DATADIR}/valid.data"
+TEST_DATA="cy_polytope,${HEADS}:${DATADIR}/test.data"
 
-# Resolve checkpoint: explicit task/path, auto-resume from existing, or null to start fresh
+# Resolve checkpoint: explicit task/path, auto-resume from existing, or null to start fresh.
+# A SLURM requeue reuses dump_path/exp_name/$SLURM_JOB_ID, so the trainer restores the
+# encoder + every head decoder on its own; the flags below cover cross-dir continuation
+# (encoder + primary decoder warm-start; aux heads restart in that case).
 ENC_CHECKPOINT=""
 DEC_CHECKPOINT=""
 case "$ENC_CHECKPOINT_ARG" in
@@ -32,12 +43,11 @@ case "$ENC_CHECKPOINT_ARG" in
     ?*)
         DIR=$(ls -d "exp/CY-4d/encoder-${ENC_CHECKPOINT_ARG}-${SIZE}/decoder-${ENC_CHECKPOINT_ARG}"/[0-9]*/ 2>/dev/null | sort -n | tail -1)
         [ -z "$DIR" ] && echo "ERROR: No checkpoint found for task ${ENC_CHECKPOINT_ARG}" >&2 && exit 1
-        ENC_CHECKPOINT="${DIR}checkpoint-encoder.pth"
-        DEC_CHECKPOINT="${DIR}checkpoint-decoder-cy_polytope.pth"
+        ENC_CHECKPOINT="${DIR}checkpoint-encoder.pth"  # warm-start encoder only; heads train fresh
         ;;
     *)  EXISTING=$(ls -d "${DUMP_PATH}/${EXP_NAME}"/[0-9]*/ 2>/dev/null | sort -n | tail -1)
         [ -n "$EXISTING" ] && ENC_CHECKPOINT="${EXISTING}checkpoint-encoder.pth" \
-                           && DEC_CHECKPOINT="${EXISTING}checkpoint-decoder-cy_polytope.pth" ;;
+                           && DEC_CHECKPOINT="${EXISTING}checkpoint-decoder-${PRIMARY}.pth" ;;
 esac
 
 echo ""
@@ -45,8 +55,10 @@ echo "=== Encoder Training ==="
 echo "  task:         cy_polytope (${TASK})	# task type and data variant"
 echo "  dump_path:    ${DUMP_PATH}	# where checkpoints and logs are saved"
 echo "  exp_name:     ${EXP_NAME}	# experiment subfolder name"
-echo "  reload_data:  ${RELOAD_DATA}	# training data"
-echo "  eval_data:    ${EVAL_DATA}	# validation and test data"
+echo "  heads:        ${HEADS} (primary ${PRIMARY})	# decoder heads from the task name"
+echo "  reload_data:  ${RELOAD_DATA}	# training data (column spec)"
+echo "  eval_data:    ${EVAL_DATA}	# validation data"
+echo "  test_data:    ${TEST_DATA}	# test data"
 echo "  n_dec_layers: 1	# decoder transformer layers (1 = lightweight head)"
 echo "  max_len:      320	# max input tokens (overrides default 256)"
 echo "  base:         1000	# base for integer tokenization (overrides default 100)"
@@ -82,6 +94,7 @@ python -u train.py \
   --base 1000 \
   --reload_data "${RELOAD_DATA}" \
   --eval_data "${EVAL_DATA}" \
+  --test_data "${TEST_DATA}" \
   --eval_size 5000 \
   --amp true \
   $EXTRA_ARGS

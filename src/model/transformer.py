@@ -354,20 +354,18 @@ class TransformerModel(BaseModel):
             self.encoder = TransformerBackbone(params, is_encoder=True, with_output=(self.architecture == "encoder_only"))
         if self.architecture in ("decoder_only", "encoder_decoder"):
             self.decoder = TransformerBackbone(params, is_encoder=False, with_output=True)
-            decoder_tasks = self._split_csv(getattr(params, "decoder_tasks", ""))
-            if decoder_tasks:
-                n_layers_list = self._parse_int_list(getattr(params, "n_dec_layers_per_task", ""), len(decoder_tasks), params.n_dec_layers)
+            # decoder_heads[0] is the primary head (-> self.decoder); the rest get aux decoders.
+            decoder_heads = list(getattr(params, "decoder_heads", []) or [])
+            aux_heads = decoder_heads[1:]
+            if aux_heads:
+                n_layers_list = self._parse_int_list(getattr(params, "n_dec_layers_per_task", ""), len(aux_heads), params.n_dec_layers)
                 self.aux_decoders = nn.ModuleDict()
-                for task_name, n_layers in zip(decoder_tasks, n_layers_list):
+                for head_name, n_layers in zip(aux_heads, n_layers_list):
                     p = copy.copy(params)
                     p.n_dec_layers = n_layers
-                    self.aux_decoders[task_name] = TransformerBackbone(p, is_encoder=False, with_output=True)
-                    logger.info(f"Auxiliary decoder '{task_name}': {n_layers} layers, "
-                                f"{sum(q.numel() for q in self.aux_decoders[task_name].parameters())} params")
-
-    @staticmethod
-    def _split_csv(s):
-        return [t.strip() for t in s.split(",") if t.strip()] if s else []
+                    self.aux_decoders[head_name] = TransformerBackbone(p, is_encoder=False, with_output=True)
+                    logger.info(f"Auxiliary decoder '{head_name}': {n_layers} layers, "
+                                f"{sum(q.numel() for q in self.aux_decoders[head_name].parameters())} params")
 
     @staticmethod
     def _parse_int_list(s, n, default):

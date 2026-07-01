@@ -10,7 +10,7 @@ logger = getLogger()
 
 
 class EnvDataset(Dataset):
-    def __init__(self, env, train, params, path, size=None):
+    def __init__(self, env, train, params, path, size=None, file_heads=None, expose_head=None):
         super().__init__()
         self.env = env
         self.train = train
@@ -41,10 +41,25 @@ class EnvDataset(Dataset):
         self.seekpos = 0
         self._fh = None
 
+        # column mode: file_heads names the answer columns (1..K); column 0 is the problem.
+        # Train exposes every head's column; eval exposes a single head (expose_head).
+        self.file_heads = list(file_heads) if file_heads else None
+        self.column_mode = self.file_heads is not None
+        if self.column_mode:
+            self.expose_heads = list(self.file_heads) if train else [expose_head]
+            assert all(h is not None for h in self.expose_heads), "eval column mode requires expose_head"
+            if self.batch_load or self.index_dataset:
+                raise NotImplementedError(
+                    "Column-spec data requires in-memory loading (no --index_dataset / --reload_size>0)."
+                )
+
         # generation, or reloading from file
         if path is not None:
             assert os.path.isfile(path)
-            if self.batch_load and self.train:
+            if self.column_mode:
+                max_lines = self.max_examples if self.max_examples > 0 else None
+                self.data = self.read_lines_columns(max_lines=max_lines, filter_by_rank=train)
+            elif self.batch_load and self.train:
                 self.load_chunk()
             elif self.index_dataset:
                 self.offsets = self._build_index()
@@ -125,6 +140,42 @@ class EnvDataset(Dataset):
         logger.info(f"Loaded {len(data)} equations from the disk.")
         return data
 
+    def read_lines_columns(self, max_lines=None, filter_by_rank=True):
+        """Read a column-mode file: each kept row is the list of tab-separated columns
+        [problem, <head columns ...>], matching 1 + len(file_heads)."""
+        n_cols = 1 + len(self.file_heads)
+        logger.info(f"Loading column data from {self.path} ({n_cols} cols: problem + {self.file_heads}) ...")
+        data = []
+        with open(self.path, encoding="utf-8") as f:
+            n_read = 0
+            for line in f:
+                if max_lines is not None and n_read >= max_lines:
+                    break
+                n_read += 1
+                if filter_by_rank and (n_read - 1) % self.n_gpu_per_node != self.local_rank:
+                    continue
+                parts = line.rstrip("\r\n").split("\t")
+                if len(parts) != n_cols:
+                    continue
+                data.append(parts)
+        logger.info(f"Loaded {len(data)} rows from the disk.")
+        assert len(data) > 0, f"No rows with {n_cols} columns found in {self.path}"
+        return data
+
+    def _read_sample_columns(self, idx):
+        row = self.data[idx]
+        problem = row[0].split()
+        if self.train:
+            answers = {h: row[1 + self.file_heads.index(h)].split() for h in self.expose_heads}
+            return problem, answers
+        # eval: expose a single head's column as the standard answer tuple
+        h = self.expose_heads[0]
+        answer = row[1 + self.file_heads.index(h)].split()
+        problem_data = self.env.problem_tokenizer.decode(problem)
+        answer_data = self.env.answer_tokenizer.decode(answer)
+        class_id = self.env.generator.encode_class_id(problem_data, None, answer_data)
+        return problem, None, answer, problem_data, None, answer_data, class_id
+
     def batch_sequences(self, sequences, bos=True, eos=True, left_pad=False):
         pad_index = self.env.pad_index
         eos_index = self.env.eos_index
@@ -142,7 +193,32 @@ class EnvDataset(Dataset):
 
         return torch.from_numpy(sent), torch.tensor(lengths, dtype=torch.long)
 
+    def _build_dec(self, enc_seqs, answers):
+        """Build (dec_tgt, dec_tgt_len, prefix_len) for a batch of answers given the encoder sequences."""
+        dec_seqs, prefix_lens = [], []
+        for enc_seq, ai in zip(enc_seqs, answers):
+            prefix = enc_seq + ["<ans>"] if self.decoder_only else ["<ans>"]
+            dec_seqs.append(prefix + list(ai))
+            prefix_lens.append(1 + len(prefix))
+        dec_tgt, dec_tgt_len = self.batch_sequences(
+            [[self.env.word2id[w] for w in seq] for seq in dec_seqs], bos=not self.encoder_only
+        )
+        return dec_tgt, dec_tgt_len, torch.tensor(prefix_lens, dtype=torch.long)
+
+    def _collate_train_columns(self, elements):
+        """Column-mode training batch: one encoder pass + one target per head, all same-row."""
+        problems, answers = zip(*elements)
+        enc_seqs = [list(p) for p in problems]
+        enc_problem, enc_problem_len = self.batch_sequences(
+            [[self.env.word2id[w] for w in seq] for seq in enc_seqs], bos=False
+        )
+        head_targets = {h: self._build_dec(enc_seqs, [a[h] for a in answers]) for h in self.expose_heads}
+        return (enc_problem, enc_problem_len), head_targets
+
     def collate_fn(self, elements):
+        if self.train and self.column_mode:
+            return self._collate_train_columns(elements)
+
         if self.train:
             problem, question, answer = zip(*elements)
             if self.export_data:
@@ -162,14 +238,7 @@ class EnvDataset(Dataset):
         else:
             enc_problem, enc_problem_len = self.batch_sequences([[self.env.word2id[w] for w in seq] for seq in enc_seqs], bos=False)
 
-        dec_seqs, prefix_lens = [], []
-        for enc_seq, ai in zip(enc_seqs, answer):
-            prefix = enc_seq + ["<ans>"] if self.decoder_only else ["<ans>"]
-            dec_seqs.append(prefix + list(ai))
-            prefix_lens.append(1 + len(prefix))
-
-        dec_tgt, dec_tgt_len = self.batch_sequences([[self.env.word2id[w] for w in seq] for seq in dec_seqs], bos=not self.encoder_only)
-        prefix_len = torch.tensor(prefix_lens, dtype=torch.long)
+        dec_tgt, dec_tgt_len, prefix_len = self._build_dec(enc_seqs, answer)
 
         if self.train:
             return (enc_problem, enc_problem_len), (dec_tgt, dec_tgt_len), prefix_len
@@ -241,14 +310,16 @@ class EnvDataset(Dataset):
                 if index >= self.nextpos:
                     self.load_chunk()
                 idx = index - self.basepos
-            else:
-                if self.two_classes:
-                    if self.rng.random() < self.first_class_prob:
-                        idx = self.rng.integers(self.first_class_size) % len(self.data)
-                    else:
-                        idx = (self.first_class_size + self.rng.integers(len(self.data) - self.first_class_size)) % len(self.data)
+            elif self.two_classes:
+                if self.rng.random() < self.first_class_prob:
+                    idx = self.rng.integers(self.first_class_size) % len(self.data)
                 else:
-                    idx = self.rng.integers(len(self.data))
+                    idx = (self.first_class_size + self.rng.integers(len(self.data) - self.first_class_size)) % len(self.data)
+            else:
+                idx = self.rng.integers(len(self.data))
+
+        if self.column_mode:
+            return self._read_sample_columns(idx)
 
         problem_str, question_str, answer_str = self.data[idx]
         problem = problem_str.split()
